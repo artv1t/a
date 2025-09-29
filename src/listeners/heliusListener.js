@@ -174,10 +174,29 @@ class HeliusListener {
       this.metrics.totalEvents++;
       this.metrics.lastEventTime = Date.now();
       
+      logger.debug('📥 Received log notification', {
+        signature,
+        hasTransaction: !!value.transaction,
+        hasMeta: !!(value.transaction && value.transaction.meta),
+        hasPostTokenBalances: !!(value.transaction && value.transaction.meta && value.transaction.meta.postTokenBalances),
+        postTokenBalancesCount: value.transaction?.meta?.postTokenBalances?.length || 0
+      });
+      
       let mints = [];
       
       if (value.transaction && value.transaction.meta && value.transaction.meta.postTokenBalances) {
         mints = this.extractMintsFromTokenBalances(value.transaction.meta.postTokenBalances);
+        logger.debug('🔍 Extracted mints from postTokenBalances', {
+          signature,
+          mintCount: mints.length,
+          mints: mints.slice(0, 3) // Log first 3 mints for debugging
+        });
+      } else {
+        logger.debug('⚠️ No postTokenBalances found, scheduling REST fallback', {
+          signature,
+          hasTransaction: !!value.transaction,
+          hasMeta: !!(value.transaction && value.transaction.meta)
+        });
       }
       
       if (mints.length === 0) {
@@ -200,15 +219,29 @@ class HeliusListener {
   extractMintsFromTokenBalances(postTokenBalances) {
     const mints = new Set();
     
+    logger.debug('🔍 Processing postTokenBalances', {
+      count: postTokenBalances.length,
+      sample: postTokenBalances.slice(0, 2) // Log first 2 for debugging
+    });
+    
     for (const balance of postTokenBalances) {
       if (balance.mint) {
         try {
           new PublicKey(balance.mint);
           mints.add(balance.mint);
+          logger.debug('✅ Valid mint found', { mint: balance.mint });
         } catch (error) {
+          logger.debug('❌ Invalid mint address', { mint: balance.mint, error: error.message });
         }
+      } else {
+        logger.debug('⚠️ Balance entry missing mint field', { balance });
       }
     }
+    
+    logger.debug('🎯 Final extracted mints', {
+      count: mints.size,
+      mints: Array.from(mints).slice(0, 5) // Log first 5 mints
+    });
     
     return Array.from(mints);
   }

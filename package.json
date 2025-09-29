@@ -1,0 +1,43 @@
+{
+  "name": "salonsniper",
+  "version": "1.0.0",
+  "description": "Solana Token Sniper Bot with Helius integration",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "lint": "eslint src/",
+    "lint:fix": "eslint src/ --fix"
+  },
+  "keywords": [
+    "solana",
+    "trading",
+    "bot",
+    "sniper",
+    "helius",
+    "defi"
+  ],
+  "author": "artv1t",
+  "license": "MIT",
+  "dependencies": {
+    "@solana/web3.js": "^1.87.6",
+    "@solana/spl-token": "^0.3.9",
+    "ws": "^8.14.2",
+    "axios": "^1.6.2",
+    "dotenv": "^16.3.1",
+    "winston": "^3.11.0",
+    "node-cache": "^5.1.2",
+    "bs58": "^5.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2",
+    "jest": "^29.7.0",
+    "eslint": "^8.55.0",
+    "eslint-config-standard": "^17.1.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}

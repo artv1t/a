@@ -175,8 +175,19 @@ class HeliusListener {
       this.metrics.totalEvents++;
       this.metrics.lastEventTime = Date.now();
       
+      logger.debug('📥 Received log notification', {
+        signature,
+        hasValue: !!value,
+        hasLogs: !!(value && value.logs),
+        logCount: value?.logs?.length || 0,
+        eventNumber: this.metrics.totalEvents
+      });
+      
       if (!signature) {
-        logger.warn('⚠️ No signature found in log notification');
+        logger.warn('⚠️ No signature found in log notification', {
+          resultStructure: Object.keys(result || {}),
+          valueStructure: Object.keys(value || {})
+        });
         return;
       }
       
@@ -184,7 +195,8 @@ class HeliusListener {
       
     } catch (error) {
       logger.error('Failed to handle log notification', { 
-        error: error.message
+        error: error.message,
+        stack: error.stack
       });
     }
   }
@@ -194,7 +206,7 @@ class HeliusListener {
     
     logger.debug('🔍 Processing postTokenBalances', {
       count: postTokenBalances.length,
-      sample: postTokenBalances.slice(0, 2) // Log first 2 for debugging
+      sample: postTokenBalances.slice(0, 2)
     });
     
     for (const balance of postTokenBalances) {
@@ -202,21 +214,107 @@ class HeliusListener {
         try {
           new PublicKey(balance.mint);
           mints.add(balance.mint);
-          logger.debug('✅ Valid mint found', { mint: balance.mint });
+          logger.debug('✅ Valid mint found from postTokenBalances', { mint: balance.mint });
         } catch (error) {
-          logger.debug('❌ Invalid mint address', { mint: balance.mint, error: error.message });
+          logger.debug('❌ Invalid mint address in postTokenBalances', { mint: balance.mint, error: error.message });
         }
       } else {
         logger.debug('⚠️ Balance entry missing mint field', { balance });
       }
     }
     
-    logger.debug('🎯 Final extracted mints', {
-      count: mints.size,
-      mints: Array.from(mints).slice(0, 5) // Log first 5 mints
+    const rawMints = Array.from(mints);
+    const filteredMints = this.filterInterestingMints(rawMints);
+    
+    logger.debug('🎯 Final extracted mints from postTokenBalances', {
+      rawCount: rawMints.length,
+      filteredCount: filteredMints.length,
+      mints: filteredMints.slice(0, 5)
     });
     
-    return Array.from(mints);
+    return filteredMints;
+  }
+
+  extractMintsFromTokenTransfers(tokenTransfers) {
+    const mints = new Set();
+    
+    logger.info('🔍 Processing tokenTransfers', {
+      count: tokenTransfers.length,
+      sample: tokenTransfers.slice(0, 2)
+    });
+    
+    for (const transfer of tokenTransfers) {
+      if (transfer.mint) {
+        try {
+          new PublicKey(transfer.mint);
+          
+          logger.info('🔍 Checking transfer validity', {
+            mint: transfer.mint,
+            hasTokenAmount: !!transfer.tokenAmount,
+            tokenAmount: transfer.tokenAmount,
+            hasFromAccount: !!transfer.fromTokenAccount,
+            hasToAccount: !!transfer.toTokenAccount,
+            fromTokenAccount: transfer.fromTokenAccount,
+            toTokenAccount: transfer.toTokenAccount
+          });
+          
+          if (this.isValidTokenTransfer(transfer)) {
+            mints.add(transfer.mint);
+            logger.info('✅ Valid mint found from tokenTransfers', { 
+              mint: transfer.mint,
+              fromTokenAccount: transfer.fromTokenAccount,
+              toTokenAccount: transfer.toTokenAccount,
+              tokenAmount: transfer.tokenAmount
+            });
+          } else {
+            logger.info('⚠️ Token transfer filtered out by isValidTokenTransfer', { 
+              mint: transfer.mint,
+              reason: 'invalid_transfer_data',
+              transfer: transfer
+            });
+          }
+        } catch (error) {
+          logger.info('❌ Invalid mint address in tokenTransfers', { 
+            mint: transfer.mint, 
+            error: error.message 
+          });
+        }
+      } else {
+        logger.info('⚠️ Transfer entry missing mint field', { transfer });
+      }
+    }
+    
+    const rawMints = Array.from(mints);
+    const filteredMints = this.filterInterestingMints(rawMints);
+    
+    logger.info('🎯 Final extracted mints from tokenTransfers', {
+      rawCount: rawMints.length,
+      filteredCount: filteredMints.length,
+      mints: filteredMints.slice(0, 5)
+    });
+    
+    return filteredMints;
+  }
+
+  isValidTokenTransfer(transfer) {
+    let amount = 0;
+    if (typeof transfer.tokenAmount === 'number') {
+      amount = transfer.tokenAmount;
+    } else if (transfer.tokenAmount && typeof transfer.tokenAmount === 'object') {
+      amount = parseFloat(transfer.tokenAmount.uiAmount || 0);
+    } else {
+      return false;
+    }
+    
+    if (amount <= 0) {
+      return false;
+    }
+    
+    if (!transfer.fromTokenAccount && !transfer.toTokenAccount) {
+      return false;
+    }
+    
+    return true;
   }
 
   async scheduleRestFallback(signature) {
@@ -230,86 +328,199 @@ class HeliusListener {
       return;
     }
     
-    try {
-      this.metrics.restFallbacks++;
-      this.recordRestCall();
-      
-      const url = `https://api.helius.xyz/v0/transactions?api-key=7c8922d6-1031-42c1-b4ee-bf5daa29abd4`;
-      const requestBody = {
-        transactions: [signature]
-      };
-      
-      logger.debug('🔗 REST fallback request', { 
-        signature, 
-        url: url.replace(/api-key=[^&]+/, 'api-key=***'),
-        method: 'POST'
-      });
-      
-      const response = await axios.post(url, requestBody, {
-        timeout: 10000,
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
-        }
-      });
-      
-      logger.debug('📥 REST fallback response', {
-        signature,
-        status: response.status,
-        hasData: !!response.data,
-        isArray: Array.isArray(response.data),
-        dataLength: response.data?.length || 0
-      });
-      
-      if (response.data && Array.isArray(response.data) && response.data.length > 0) {
-        const transaction = response.data[0];
+    const maxRetries = 2;
+    let attempt = 0;
+    
+    while (attempt <= maxRetries) {
+      try {
+        this.metrics.restFallbacks++;
+        this.recordRestCall();
         
-        let mints = [];
+        const url = `https://api.helius.xyz/v0/transactions?api-key=7c8922d6-1031-42c1-b4ee-bf5daa29abd4`;
+        const requestBody = {
+          transactions: [signature]
+        };
         
-        if (transaction.tokenTransfers && Array.isArray(transaction.tokenTransfers)) {
-          mints = transaction.tokenTransfers.map(transfer => transfer.mint).filter(mint => mint);
-          
-          logger.debug('✅ REST fallback success - tokenTransfers', {
-            signature,
-            mintCount: mints.length,
-            mints: mints.slice(0, 3),
-            tokenTransfersCount: transaction.tokenTransfers.length
-          });
-        } else {
-          logger.debug('⚠️ REST fallback: no tokenTransfers found', {
-            signature,
-            transactionKeys: transaction ? Object.keys(transaction) : [],
-            hasTokenTransfers: !!(transaction && transaction.tokenTransfers)
-          });
-        }
+        logger.debug('🔗 REST fallback request', { 
+          signature, 
+          attempt: attempt + 1,
+          maxRetries: maxRetries + 1,
+          url: url.replace(/api-key=[^&]+/, 'api-key=***'),
+          method: 'POST'
+        });
         
-        if (mints.length > 0) {
-          this.queueEvent({
-            signature,
-            mints,
-            timestamp: Date.now(),
-            source: 'rest_fallback'
-          });
-        }
-      } else {
-        logger.debug('⚠️ REST fallback: invalid response format', {
+        const response = await axios.post(url, requestBody, {
+          timeout: 15000,
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'User-Agent': 'SalonSniper/1.0',
+            'X-Request-ID': `${signature.slice(0, 8)}-${Date.now()}`
+          },
+          validateStatus: (status) => status < 500
+        });
+        
+        logger.debug('📥 REST fallback response', {
           signature,
+          attempt: attempt + 1,
+          status: response.status,
           hasData: !!response.data,
           isArray: Array.isArray(response.data),
-          dataType: typeof response.data
+          dataLength: response.data?.length || 0
         });
+        
+        if (response.status >= 400 && response.status < 500) {
+          logger.warn('⚠️ REST fallback client error, not retrying', {
+            signature,
+            status: response.status,
+            statusText: response.statusText
+          });
+          return;
+        }
+        
+        if (response.data && Array.isArray(response.data) && response.data.length > 0) {
+          const transaction = response.data[0];
+          
+          logger.info('🔍 REST API response structure', {
+            signature,
+            attempt: attempt + 1,
+            transactionKeys: transaction ? Object.keys(transaction) : [],
+            hasTokenTransfers: !!(transaction && transaction.tokenTransfers),
+            hasTokenBalances: !!(transaction && transaction.tokenBalances),
+            hasAccountData: !!(transaction && transaction.accountData),
+            hasInstructions: !!(transaction && transaction.instructions),
+            hasEvents: !!(transaction && transaction.events),
+            responseStructure: {
+              type: typeof transaction,
+              keys: transaction ? Object.keys(transaction).slice(0, 10) : []
+            }
+          });
+          
+          let mints = [];
+          
+          if (transaction.tokenTransfers && Array.isArray(transaction.tokenTransfers)) {
+            mints = this.extractMintsFromTokenTransfers(transaction.tokenTransfers);
+            
+            logger.info('✅ REST fallback success - tokenTransfers', {
+              signature,
+              attempt: attempt + 1,
+              mintCount: mints.length,
+              mints: mints.slice(0, 3),
+              tokenTransfersCount: transaction.tokenTransfers.length
+            });
+          }
+          else if (transaction.tokenBalances && Array.isArray(transaction.tokenBalances)) {
+            mints = this.extractMintsFromTokenBalances(transaction.tokenBalances);
+            
+            logger.info('✅ REST fallback success - tokenBalances', {
+              signature,
+              attempt: attempt + 1,
+              mintCount: mints.length,
+              mints: mints.slice(0, 3),
+              tokenBalancesCount: transaction.tokenBalances.length
+            });
+          }
+          else if (transaction.accountData && Array.isArray(transaction.accountData)) {
+            for (const accountInfo of transaction.accountData) {
+              if (accountInfo.account && accountInfo.account.includes('Token')) {
+                logger.debug('🔍 Found Token account in accountData', {
+                  signature,
+                  account: accountInfo.account,
+                  accountKeys: accountInfo ? Object.keys(accountInfo) : []
+                });
+              }
+            }
+            
+            logger.debug('⚠️ REST fallback: found accountData but no mints extracted', {
+              signature,
+              attempt: attempt + 1,
+              accountDataCount: transaction.accountData.length
+            });
+          }
+          else {
+            logger.debug('⚠️ REST fallback: no token data found', {
+              signature,
+              attempt: attempt + 1,
+              transactionKeys: transaction ? Object.keys(transaction) : [],
+              hasTokenTransfers: !!(transaction && transaction.tokenTransfers),
+              hasTokenBalances: !!(transaction && transaction.tokenBalances),
+              hasAccountData: !!(transaction && transaction.accountData),
+              sampleTransaction: transaction ? JSON.stringify(transaction).slice(0, 500) : null
+            });
+          }
+          
+          if (mints.length > 0) {
+            this.queueEvent({
+              signature,
+              mints,
+              timestamp: Date.now(),
+              source: 'rest_fallback'
+            });
+          }
+          
+          return;
+        } else {
+          logger.debug('⚠️ REST fallback: invalid response format', {
+            signature,
+            attempt: attempt + 1,
+            hasData: !!response.data,
+            isArray: Array.isArray(response.data),
+            dataType: typeof response.data
+          });
+        }
+        
+        return;
+        
+      } catch (error) {
+        attempt++;
+        
+        const isRetryable = error.code === 'ECONNRESET' || 
+                           error.code === 'ETIMEDOUT' ||
+                           (error.response && error.response.status >= 500);
+        
+        if (attempt <= maxRetries && isRetryable) {
+          const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
+          logger.warn('⚠️ REST fallback failed, retrying', { 
+            signature, 
+            attempt,
+            maxRetries: maxRetries + 1,
+            error: error.message,
+            retryDelay: delay,
+            isRetryable
+          });
+          
+          await new Promise(resolve => setTimeout(resolve, delay));
+          continue;
+        }
+        
+        logger.error('REST fallback failed after retries', { 
+          signature, 
+          attempt,
+          error: error.message,
+          status: error.response?.status,
+          statusText: error.response?.statusText,
+          responseData: error.response?.data,
+          url: error.config?.url?.replace(/api-key=[^&]+/, 'api-key=***')
+        });
+        
+        return;
       }
-      
-    } catch (error) {
-      logger.error('REST fallback failed', { 
-        signature, 
-        error: error.message,
-        status: error.response?.status,
-        statusText: error.response?.statusText,
-        responseData: error.response?.data,
-        url: error.config?.url?.replace(/api-key=[^&]+/, 'api-key=***')
-      });
     }
+  }
+
+  filterInterestingMints(mints) {
+    const commonTokens = new Set([
+      'So11111111111111111111111111111111111111112', // SOL
+      'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
+      'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
+      '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R', // RAY
+      'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So',  // mSOL
+      'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', // BONK
+      '7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs', // ETH
+      '9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E', // BTC
+    ]);
+    
+    return mints.filter(mint => !commonTokens.has(mint));
   }
 
   canMakeRestCall() {
@@ -434,6 +645,10 @@ class HeliusListener {
 
   async processBatch() {
     if (this.isProcessingBatch || this.eventQueue.length === 0) {
+      logger.debug('⚠️ Batch processing skipped', {
+        isProcessingBatch: this.isProcessingBatch,
+        queueLength: this.eventQueue.length
+      });
       return;
     }
     
@@ -444,16 +659,35 @@ class HeliusListener {
     const batch = [...this.eventQueue];
     this.eventQueue = [];
     
+    logger.debug('🔄 Processing batch', {
+      eventCount: batch.length,
+      queueSizeBefore: batch.length,
+      queueSizeAfter: this.eventQueue.length,
+      batchNumber: this.metrics.batchesProcessed + 1
+    });
+    
     try {
       const allMints = new Set();
       const signatures = new Set();
+      const eventSources = {};
       
       for (const event of batch) {
         signatures.add(event.signature);
         for (const mint of event.mints) {
           allMints.add(mint);
         }
+        
+        const source = event.source || 'unknown';
+        eventSources[source] = (eventSources[source] || 0) + 1;
       }
+      
+      logger.debug('🎯 Batch mint extraction results', {
+        totalMintsFromEvents: allMints.size,
+        uniqueSignatures: signatures.size,
+        sampleMints: Array.from(allMints).slice(0, 5),
+        eventSources,
+        batchProcessingTimeMs: Date.now() - startTime
+      });
       
       const batchData = {
         mints: Array.from(allMints),
@@ -465,25 +699,48 @@ class HeliusListener {
       const processingTime = Date.now() - startTime;
       logger.logBatch(batch.length, processingTime, {
         mintCount: allMints.size,
-        signatureCount: signatures.size
+        signatureCount: signatures.size,
+        batchNumber: this.metrics.batchesProcessed + 1,
+        eventSources
       });
       
       for (const handler of this.eventHandlers) {
         try {
+          logger.debug('📤 Calling batch handler', {
+            mintCount: allMints.size,
+            eventCount: batch.length
+          });
           await handler(batchData);
         } catch (error) {
-          logger.error('Batch handler failed', { error: error.message });
+          logger.error('Batch handler failed', { 
+            error: error.message,
+            stack: error.stack
+          });
         }
       }
       
       this.metrics.batchesProcessed++;
       
+      logger.debug('✅ Batch processing completed', {
+        batchNumber: this.metrics.batchesProcessed,
+        totalProcessingTimeMs: Date.now() - startTime,
+        mintCount: allMints.size,
+        eventCount: batch.length
+      });
+      
     } catch (error) {
-      logger.error('Batch processing failed', { error: error.message });
+      logger.error('Batch processing failed', { 
+        error: error.message,
+        stack: error.stack,
+        batchSize: batch.length
+      });
     } finally {
       this.isProcessingBatch = false;
       
       if (this.eventQueue.length > 0) {
+        logger.debug('🔄 Scheduling next batch processing', {
+          remainingQueueSize: this.eventQueue.length
+        });
         this.scheduleBatchProcessing();
       }
     }

@@ -139,7 +139,7 @@ class HeliusListener {
       ]
     };
 
-    logger.info('📡 Subscribing to SPL Token Program logs');
+    logger.info('📡 Subscribing to SPL Token Program logs (Developer plan) with REST Parse API fallback');
     this.ws.send(JSON.stringify(subscribeMessage));
   }
 
@@ -169,50 +169,23 @@ class HeliusListener {
   async handleLogNotification(params) {
     try {
       const { result } = params;
-      const { signature, value } = result;
+      const { value } = result;
+      const { signature } = value;
       
       this.metrics.totalEvents++;
       this.metrics.lastEventTime = Date.now();
       
-      logger.debug('📥 Received log notification', {
-        signature,
-        hasTransaction: !!value.transaction,
-        hasMeta: !!(value.transaction && value.transaction.meta),
-        hasPostTokenBalances: !!(value.transaction && value.transaction.meta && value.transaction.meta.postTokenBalances),
-        postTokenBalancesCount: value.transaction?.meta?.postTokenBalances?.length || 0
-      });
-      
-      let mints = [];
-      
-      if (value.transaction && value.transaction.meta && value.transaction.meta.postTokenBalances) {
-        mints = this.extractMintsFromTokenBalances(value.transaction.meta.postTokenBalances);
-        logger.debug('🔍 Extracted mints from postTokenBalances', {
-          signature,
-          mintCount: mints.length,
-          mints: mints.slice(0, 3) // Log first 3 mints for debugging
-        });
-      } else {
-        logger.debug('⚠️ No postTokenBalances found, scheduling REST fallback', {
-          signature,
-          hasTransaction: !!value.transaction,
-          hasMeta: !!(value.transaction && value.transaction.meta)
-        });
-      }
-      
-      if (mints.length === 0) {
-        await this.scheduleRestFallback(signature);
+      if (!signature) {
+        logger.warn('⚠️ No signature found in log notification');
         return;
       }
       
-      this.queueEvent({
-        signature,
-        mints,
-        timestamp: Date.now(),
-        source: 'websocket'
-      });
+      this.queueSignatureForBatch(signature);
       
     } catch (error) {
-      logger.error('Failed to handle log notification', { error: error.message });
+      logger.error('Failed to handle log notification', { 
+        error: error.message
+      });
     }
   }
 
@@ -247,6 +220,11 @@ class HeliusListener {
   }
 
   async scheduleRestFallback(signature) {
+    if (!signature || typeof signature !== 'string') {
+      logger.warn('⚠️ Invalid signature for REST fallback', { signature });
+      return;
+    }
+    
     if (!this.canMakeRestCall()) {
       logger.warn('⚠️ REST fallback rate limit exceeded, skipping', { signature });
       return;
@@ -256,16 +234,54 @@ class HeliusListener {
       this.metrics.restFallbacks++;
       this.recordRestCall();
       
-      const url = this.config.parseUrl.replace('?', `/${signature}?`);
-      const response = await axios.get(url, {
-        timeout: 5000,
+      const url = `https://api.helius.xyz/v0/transactions?api-key=7c8922d6-1031-42c1-b4ee-bf5daa29abd4`;
+      const requestBody = {
+        transactions: [signature]
+      };
+      
+      logger.debug('🔗 REST fallback request', { 
+        signature, 
+        url: url.replace(/api-key=[^&]+/, 'api-key=***'),
+        method: 'POST'
+      });
+      
+      const response = await axios.post(url, requestBody, {
+        timeout: 10000,
         headers: {
-          'Content-Type': 'application/json'
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
         }
       });
       
-      if (response.data && response.data.meta && response.data.meta.postTokenBalances) {
-        const mints = this.extractMintsFromTokenBalances(response.data.meta.postTokenBalances);
+      logger.debug('📥 REST fallback response', {
+        signature,
+        status: response.status,
+        hasData: !!response.data,
+        isArray: Array.isArray(response.data),
+        dataLength: response.data?.length || 0
+      });
+      
+      if (response.data && Array.isArray(response.data) && response.data.length > 0) {
+        const transaction = response.data[0];
+        
+        let mints = [];
+        
+        if (transaction.tokenTransfers && Array.isArray(transaction.tokenTransfers)) {
+          mints = transaction.tokenTransfers.map(transfer => transfer.mint).filter(mint => mint);
+          
+          logger.debug('✅ REST fallback success - tokenTransfers', {
+            signature,
+            mintCount: mints.length,
+            mints: mints.slice(0, 3),
+            tokenTransfersCount: transaction.tokenTransfers.length
+          });
+        } else {
+          logger.debug('⚠️ REST fallback: no tokenTransfers found', {
+            signature,
+            transactionKeys: transaction ? Object.keys(transaction) : [],
+            hasTokenTransfers: !!(transaction && transaction.tokenTransfers)
+          });
+        }
         
         if (mints.length > 0) {
           this.queueEvent({
@@ -275,12 +291,23 @@ class HeliusListener {
             source: 'rest_fallback'
           });
         }
+      } else {
+        logger.debug('⚠️ REST fallback: invalid response format', {
+          signature,
+          hasData: !!response.data,
+          isArray: Array.isArray(response.data),
+          dataType: typeof response.data
+        });
       }
       
     } catch (error) {
       logger.error('REST fallback failed', { 
         signature, 
-        error: error.message 
+        error: error.message,
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        responseData: error.response?.data,
+        url: error.config?.url?.replace(/api-key=[^&]+/, 'api-key=***')
       });
     }
   }
@@ -296,6 +323,64 @@ class HeliusListener {
 
   recordRestCall() {
     this.restCallTimes.push(Date.now());
+  }
+
+  queueSignatureForBatch(signature) {
+    if (!this.signatureQueue) {
+      this.signatureQueue = [];
+    }
+    
+    this.signatureQueue.push({
+      signature,
+      timestamp: Date.now()
+    });
+    
+    this.scheduleSignatureBatchProcessing();
+  }
+
+  scheduleSignatureBatchProcessing() {
+    if (this.signatureBatchTimer || this.isProcessingSignatureBatch) {
+      return;
+    }
+    
+    this.signatureBatchTimer = setTimeout(() => {
+      this.processSignatureBatch();
+    }, this.config.batchWindowMs);
+  }
+
+  async processSignatureBatch() {
+    if (this.isProcessingSignatureBatch || !this.signatureQueue || this.signatureQueue.length === 0) {
+      return;
+    }
+    
+    this.isProcessingSignatureBatch = true;
+    this.signatureBatchTimer = null;
+    
+    const batch = [...this.signatureQueue];
+    this.signatureQueue = [];
+    
+    logger.info('🔄 Processing signature batch', {
+      batchSize: batch.length,
+      rateLimitAllows: this.config.restFallbackLimit
+    });
+    
+    const signaturestoProcess = batch.slice(0, this.config.restFallbackLimit);
+    
+    for (const item of signaturestoProcess) {
+      if (this.canMakeRestCall()) {
+        await this.scheduleRestFallback(item.signature);
+        await new Promise(resolve => setTimeout(resolve, 200));
+      } else {
+        logger.debug('⚠️ Skipping signature due to rate limit', { signature: item.signature });
+        break;
+      }
+    }
+    
+    this.isProcessingSignatureBatch = false;
+    
+    if (this.signatureQueue && this.signatureQueue.length > 0) {
+      this.scheduleSignatureBatchProcessing();
+    }
   }
 
   queueEvent(event) {

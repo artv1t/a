@@ -328,8 +328,9 @@ class HeliusListener {
       return;
     }
     
-    const maxRetries = 2;
+    const maxRetries = 3;
     let attempt = 0;
+    let lastError = null;
     
     while (attempt <= maxRetries) {
       try {
@@ -341,21 +342,29 @@ class HeliusListener {
           transactions: [signature]
         };
         
+        const backoffDelay = attempt > 0 ? Math.min(1000 * Math.pow(2, attempt - 1), 5000) : 0;
+        if (backoffDelay > 0) {
+          logger.debug('⏳ REST fallback backoff delay', { signature, attempt: attempt + 1, delay: backoffDelay });
+          await new Promise(resolve => setTimeout(resolve, backoffDelay));
+        }
+        
         logger.debug('🔗 REST fallback request', { 
           signature, 
           attempt: attempt + 1,
           maxRetries: maxRetries + 1,
           url: url.replace(/api-key=[^&]+/, 'api-key=***'),
-          method: 'POST'
+          method: 'POST',
+          backoffDelay
         });
         
         const response = await axios.post(url, requestBody, {
-          timeout: 15000,
+          timeout: 20000,
           headers: {
             'Content-Type': 'application/json',
             'Accept': 'application/json',
             'User-Agent': 'SalonSniper/1.0',
-            'X-Request-ID': `${signature.slice(0, 8)}-${Date.now()}`
+            'X-Request-ID': `${signature.slice(0, 8)}-${Date.now()}`,
+            'Cache-Control': 'no-cache'
           },
           validateStatus: (status) => status < 500
         });
@@ -366,14 +375,16 @@ class HeliusListener {
           status: response.status,
           hasData: !!response.data,
           isArray: Array.isArray(response.data),
-          dataLength: response.data?.length || 0
+          dataLength: response.data?.length || 0,
+          responseTime: response.headers['x-response-time'] || 'unknown'
         });
         
         if (response.status >= 400 && response.status < 500) {
           logger.warn('⚠️ REST fallback client error, not retrying', {
             signature,
             status: response.status,
-            statusText: response.statusText
+            statusText: response.statusText,
+            attempt: attempt + 1
           });
           return;
         }
@@ -387,6 +398,7 @@ class HeliusListener {
             transactionKeys: transaction ? Object.keys(transaction) : [],
             hasTokenTransfers: !!(transaction && transaction.tokenTransfers),
             hasTokenBalances: !!(transaction && transaction.tokenBalances),
+            hasPostTokenBalances: !!(transaction && transaction.meta && transaction.meta.postTokenBalances),
             hasAccountData: !!(transaction && transaction.accountData),
             hasInstructions: !!(transaction && transaction.instructions),
             hasEvents: !!(transaction && transaction.events),
@@ -396,29 +408,71 @@ class HeliusListener {
             }
           });
           
-          let mints = [];
+          let allMints = new Set();
+          let extractionSources = [];
           
           if (transaction.tokenTransfers && Array.isArray(transaction.tokenTransfers)) {
-            mints = this.extractMintsFromTokenTransfers(transaction.tokenTransfers);
+            const transferMints = this.extractMintsFromTokenTransfers(transaction.tokenTransfers);
+            transferMints.forEach(mint => allMints.add(mint));
+            extractionSources.push(`tokenTransfers(${transferMints.length})`);
             
-            logger.info('✅ REST fallback success - tokenTransfers', {
+            logger.info('✅ REST fallback - tokenTransfers extracted', {
               signature,
               attempt: attempt + 1,
-              mintCount: mints.length,
-              mints: mints.slice(0, 3),
+              mintCount: transferMints.length,
+              mints: transferMints.slice(0, 3),
               tokenTransfersCount: transaction.tokenTransfers.length
             });
           }
-          else if (transaction.tokenBalances && Array.isArray(transaction.tokenBalances)) {
-            mints = this.extractMintsFromTokenBalances(transaction.tokenBalances);
+          
+          if (transaction.tokenBalances && Array.isArray(transaction.tokenBalances)) {
+            const balanceMints = this.extractMintsFromTokenBalances(transaction.tokenBalances);
+            balanceMints.forEach(mint => allMints.add(mint));
+            extractionSources.push(`tokenBalances(${balanceMints.length})`);
             
-            logger.info('✅ REST fallback success - tokenBalances', {
+            logger.info('✅ REST fallback - tokenBalances extracted', {
               signature,
               attempt: attempt + 1,
-              mintCount: mints.length,
-              mints: mints.slice(0, 3),
+              mintCount: balanceMints.length,
+              mints: balanceMints.slice(0, 3),
               tokenBalancesCount: transaction.tokenBalances.length
             });
+          }
+          
+          if (transaction.meta && transaction.meta.postTokenBalances && Array.isArray(transaction.meta.postTokenBalances)) {
+            const postBalanceMints = this.extractMintsFromTokenBalances(transaction.meta.postTokenBalances);
+            postBalanceMints.forEach(mint => allMints.add(mint));
+            extractionSources.push(`postTokenBalances(${postBalanceMints.length})`);
+            
+            logger.info('✅ REST fallback - postTokenBalances extracted', {
+              signature,
+              attempt: attempt + 1,
+              mintCount: postBalanceMints.length,
+              mints: postBalanceMints.slice(0, 3),
+              postTokenBalancesCount: transaction.meta.postTokenBalances.length
+            });
+          }
+          
+          const finalMints = Array.from(allMints);
+          
+          if (finalMints.length > 0) {
+            logger.info('🎯 REST fallback combined success', {
+              signature,
+              attempt: attempt + 1,
+              totalMintCount: finalMints.length,
+              mints: finalMints.slice(0, 5),
+              extractionSources: extractionSources.join(', '),
+              combinedFromSources: extractionSources.length
+            });
+            
+            this.queueEvent({
+              signature,
+              mints: finalMints,
+              timestamp: Date.now(),
+              source: 'rest_fallback_enhanced'
+            });
+            
+            return;
           }
           else if (transaction.accountData && Array.isArray(transaction.accountData)) {
             for (const accountInfo of transaction.accountData) {
@@ -449,14 +503,6 @@ class HeliusListener {
             });
           }
           
-          if (mints.length > 0) {
-            this.queueEvent({
-              signature,
-              mints,
-              timestamp: Date.now(),
-              source: 'rest_fallback'
-            });
-          }
           
           return;
         } else {
@@ -529,11 +575,61 @@ class HeliusListener {
     
     this.restCallTimes = this.restCallTimes.filter(time => time > oneSecondAgo);
     
-    return this.restCallTimes.length < this.config.restFallbackLimit;
+    // Step 2.2 Enhancement: Burst capacity with sustained rate limiting
+    const burstCapacity = Math.min(this.config.restFallbackLimit * 2, 15);
+    const sustainedLimit = this.config.restFallbackLimit;
+    
+    // Allow burst for first few calls, then enforce sustained rate
+    const recentCalls = this.restCallTimes.length;
+    const canBurst = recentCalls < burstCapacity;
+    const withinSustainedRate = recentCalls < sustainedLimit;
+    
+    // If we have made many calls recently, check longer window for sustained rate
+    if (recentCalls >= sustainedLimit) {
+      const longerWindowStart = now - 5000; // 5 second window
+      const longerWindowCalls = this.restCallTimes.filter(time => time > longerWindowStart).length;
+      const sustainedRateOk = longerWindowCalls < (sustainedLimit * 5);
+      
+      logger.debug('🚦 REST rate limit check - sustained rate', {
+        recentCalls,
+        longerWindowCalls,
+        sustainedLimit,
+        sustainedRateOk,
+        burstCapacity
+      });
+      
+      return sustainedRateOk;
+    }
+    
+    logger.debug('🚦 REST rate limit check', {
+      recentCalls,
+      sustainedLimit,
+      burstCapacity,
+      canBurst,
+      withinSustainedRate,
+      allowed: canBurst || withinSustainedRate
+    });
+    
+    return canBurst || withinSustainedRate;
   }
 
   recordRestCall() {
-    this.restCallTimes.push(Date.now());
+    const now = Date.now();
+    this.restCallTimes.push(now);
+    
+    // Step 2.2 Enhancement: Track REST call performance metrics
+    if (!this.metrics.restCallStats) {
+      this.metrics.restCallStats = {
+        totalCalls: 0,
+        successfulCalls: 0,
+        failedCalls: 0,
+        averageResponseTime: 0,
+        lastCallTime: 0
+      };
+    }
+    
+    this.metrics.restCallStats.totalCalls++;
+    this.metrics.restCallStats.lastCallTime = now;
   }
 
   queueSignatureForBatch(signature) {
@@ -798,11 +894,17 @@ class HeliusListener {
   }
 
   logMetrics() {
+    const now = Date.now();
     const restFallbackRate = this.metrics.totalEvents > 0 
       ? this.metrics.restFallbacks / this.metrics.totalEvents 
       : 0;
     
-    logger.info('📊 Helius Listener Metrics', {
+    // Step 2.2 Enhancement: Comprehensive metrics with performance indicators
+    const uptimeSeconds = Math.floor((now - this.metrics.startTime) / 1000);
+    const eventsPerSecond = uptimeSeconds > 0 ? (this.metrics.totalEvents / uptimeSeconds).toFixed(2) : '0.00';
+    const batchesPerMinute = uptimeSeconds > 60 ? ((this.metrics.batchesProcessed / uptimeSeconds) * 60).toFixed(2) : '0.00';
+    
+    const baseMetrics = {
       totalEvents: this.metrics.totalEvents,
       dedupFiltered: this.metrics.dedupFiltered,
       batchesProcessed: this.metrics.batchesProcessed,
@@ -810,8 +912,49 @@ class HeliusListener {
       restFallbackRate: Math.round(restFallbackRate * 100) / 100,
       reconnects: this.metrics.reconnects,
       queueSize: this.eventQueue.length,
-      cacheSize: this.seenMints.getStats().keys
-    });
+      cacheSize: this.seenMints.getStats().keys,
+      uptimeSeconds,
+      performance: {
+        eventsPerSecond: parseFloat(eventsPerSecond),
+        batchesPerMinute: parseFloat(batchesPerMinute)
+      }
+    };
+
+    // Add REST call stats if available
+    if (this.metrics.restCallStats) {
+      const successRate = this.metrics.restCallStats.totalCalls > 0 ? 
+        ((this.metrics.restCallStats.successfulCalls / this.metrics.restCallStats.totalCalls) * 100).toFixed(1) : '0.0';
+      
+      baseMetrics.restCallStats = {
+        totalCalls: this.metrics.restCallStats.totalCalls,
+        successfulCalls: this.metrics.restCallStats.successfulCalls,
+        failedCalls: this.metrics.restCallStats.failedCalls,
+        successRate: successRate + '%',
+        averageResponseTime: this.metrics.restCallStats.averageResponseTime,
+        lastCallTime: this.metrics.restCallStats.lastCallTime
+      };
+    }
+    
+    logger.info('📊 Helius Listener Enhanced Metrics', baseMetrics);
+    
+    // Step 2.2 Enhancement: Health warnings based on metrics
+    if (this.metrics.batchesProcessed > 10) {
+      const emptyBatchRate = this.metrics.dedupFiltered > 0 ? 
+        (this.metrics.dedupFiltered / this.metrics.totalEvents) * 100 : 0;
+      if (emptyBatchRate > 50) {
+        logger.warn('⚠️ High deduplication rate detected', {
+          dedupRate: emptyBatchRate.toFixed(1) + '%',
+          possibleCauses: ['high_duplicate_activity', 'cache_working_well']
+        });
+      }
+    }
+    
+    if (restFallbackRate > 0.8) {
+      logger.warn('⚠️ High REST fallback rate detected', {
+        restFallbackRate: (restFallbackRate * 100).toFixed(1) + '%',
+        possibleCauses: ['websocket_missing_data', 'api_limitations', 'network_issues']
+      });
+    }
   }
 
   logHealth(event, data = {}) {

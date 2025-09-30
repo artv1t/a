@@ -16,6 +16,7 @@ class HeliusListener {
       restFallbackLimit: parseInt(process.env.REST_FALLBACK_LIMIT_PER_SEC) || 5,
       maxBacklog: parseInt(process.env.MAX_BACKLOG_EVENTS) || 10000,
       maxReconnectDelay: parseInt(process.env.WS_RECONNECT_MAX_DELAY_S) || 60,
+      maxTokenAgeHours: parseFloat(process.env.MAX_TOKEN_AGE_HOURS) || 1.5,
       ...config
     };
 
@@ -45,7 +46,9 @@ class HeliusListener {
       batchesProcessed: 0,
       restFallbacks: 0,
       reconnects: 0,
-      lastEventTime: null
+      lastEventTime: null,
+      ageFiltered: 0,
+      ageCheckErrors: 0
     };
 
     this.eventHandlers = [];
@@ -201,7 +204,7 @@ class HeliusListener {
     }
   }
 
-  extractMintsFromTokenBalances(postTokenBalances) {
+  async extractMintsFromTokenBalances(postTokenBalances) {
     const mints = new Set();
     
     logger.debug('🔍 Processing postTokenBalances', {
@@ -224,18 +227,20 @@ class HeliusListener {
     }
     
     const rawMints = Array.from(mints);
-    const filteredMints = this.filterInterestingMints(rawMints);
+    const interestingMints = this.filterInterestingMints(rawMints);
+    const youngMints = await this.filterByAge(interestingMints);
     
     logger.debug('🎯 Final extracted mints from postTokenBalances', {
       rawCount: rawMints.length,
-      filteredCount: filteredMints.length,
-      mints: filteredMints.slice(0, 5)
+      interestingCount: interestingMints.length,
+      youngCount: youngMints.length,
+      mints: youngMints.slice(0, 5)
     });
     
-    return filteredMints;
+    return youngMints;
   }
 
-  extractMintsFromTokenTransfers(tokenTransfers) {
+  async extractMintsFromTokenTransfers(tokenTransfers) {
     const mints = new Set();
     
     logger.info('🔍 Processing tokenTransfers', {
@@ -285,15 +290,17 @@ class HeliusListener {
     }
     
     const rawMints = Array.from(mints);
-    const filteredMints = this.filterInterestingMints(rawMints);
+    const interestingMints = this.filterInterestingMints(rawMints);
+    const youngMints = await this.filterByAge(interestingMints);
     
     logger.info('🎯 Final extracted mints from tokenTransfers', {
       rawCount: rawMints.length,
-      filteredCount: filteredMints.length,
-      mints: filteredMints.slice(0, 5)
+      interestingCount: interestingMints.length,
+      youngCount: youngMints.length,
+      mints: youngMints.slice(0, 5)
     });
     
-    return filteredMints;
+    return youngMints;
   }
 
   isValidTokenTransfer(transfer) {
@@ -412,7 +419,7 @@ class HeliusListener {
           let extractionSources = [];
           
           if (transaction.tokenTransfers && Array.isArray(transaction.tokenTransfers)) {
-            const transferMints = this.extractMintsFromTokenTransfers(transaction.tokenTransfers);
+            const transferMints = await this.extractMintsFromTokenTransfers(transaction.tokenTransfers);
             transferMints.forEach(mint => allMints.add(mint));
             extractionSources.push(`tokenTransfers(${transferMints.length})`);
             
@@ -426,7 +433,7 @@ class HeliusListener {
           }
           
           if (transaction.tokenBalances && Array.isArray(transaction.tokenBalances)) {
-            const balanceMints = this.extractMintsFromTokenBalances(transaction.tokenBalances);
+            const balanceMints = await this.extractMintsFromTokenBalances(transaction.tokenBalances);
             balanceMints.forEach(mint => allMints.add(mint));
             extractionSources.push(`tokenBalances(${balanceMints.length})`);
             
@@ -440,7 +447,7 @@ class HeliusListener {
           }
           
           if (transaction.meta && transaction.meta.postTokenBalances && Array.isArray(transaction.meta.postTokenBalances)) {
-            const postBalanceMints = this.extractMintsFromTokenBalances(transaction.meta.postTokenBalances);
+            const postBalanceMints = await this.extractMintsFromTokenBalances(transaction.meta.postTokenBalances);
             postBalanceMints.forEach(mint => allMints.add(mint));
             extractionSources.push(`postTokenBalances(${postBalanceMints.length})`);
             
@@ -567,6 +574,130 @@ class HeliusListener {
     ]);
     
     return mints.filter(mint => !commonTokens.has(mint));
+  }
+
+  async checkTokenAge(mint) {
+    try {
+      const response = await axios.post(this.config.rpcUrl, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'getAccountInfo',
+        params: [
+          mint,
+          {
+            encoding: 'base64',
+            commitment: 'confirmed'
+          }
+        ]
+      }, {
+        timeout: 5000,
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+
+      if (!response.data.result || !response.data.result.value) {
+        logger.debug('❌ Token account not found for age check', { mint });
+        return false;
+      }
+
+      const accountInfo = response.data.result.value;
+      if (!accountInfo.executable && accountInfo.lamports > 0) {
+        const currentTime = Date.now();
+        const maxAgeMs = this.config.maxTokenAgeHours * 60 * 60 * 1000;
+        
+        const response2 = await axios.post(this.config.rpcUrl, {
+          jsonrpc: '2.0',
+          id: 2,
+          method: 'getSignaturesForAddress',
+          params: [
+            mint,
+            {
+              limit: 1,
+              commitment: 'confirmed'
+            }
+          ]
+        }, {
+          timeout: 5000,
+          headers: {
+            'Content-Type': 'application/json'
+          }
+        });
+
+        if (response2.data.result && response2.data.result.length > 0) {
+          const firstSignature = response2.data.result[response2.data.result.length - 1];
+          if (firstSignature.blockTime) {
+            const tokenCreationTime = firstSignature.blockTime * 1000;
+            const tokenAge = currentTime - tokenCreationTime;
+            const isYoung = tokenAge <= maxAgeMs;
+            
+            logger.debug('🕐 Token age check', {
+              mint: mint.slice(0, 8) + '...',
+              ageMinutes: Math.round(tokenAge / (1000 * 60)),
+              maxAgeHours: this.config.maxTokenAgeHours,
+              isYoung,
+              creationTime: new Date(tokenCreationTime).toISOString()
+            });
+            
+            return isYoung;
+          }
+        }
+      }
+      
+      logger.debug('⚠️ Could not determine token age, allowing through', { mint: mint.slice(0, 8) + '...' });
+      return true;
+      
+    } catch (error) {
+      this.metrics.ageCheckErrors++;
+      logger.debug('❌ Error checking token age, allowing through', { 
+        mint: mint.slice(0, 8) + '...',
+        error: error.message 
+      });
+      return true;
+    }
+  }
+
+  async filterByAge(mints) {
+    if (mints.length === 0) {
+      return mints;
+    }
+
+    logger.debug('🕐 Starting age filtering', {
+      inputCount: mints.length,
+      maxAgeHours: this.config.maxTokenAgeHours
+    });
+
+    const ageCheckPromises = mints.map(async (mint) => {
+      const isYoung = await this.checkTokenAge(mint);
+      return { mint, isYoung };
+    });
+
+    try {
+      const ageResults = await Promise.all(ageCheckPromises);
+      const youngMints = ageResults
+        .filter(result => result.isYoung)
+        .map(result => result.mint);
+      
+      const filteredCount = mints.length - youngMints.length;
+      this.metrics.ageFiltered += filteredCount;
+
+      logger.info('🕐 Age filtering completed', {
+        inputCount: mints.length,
+        outputCount: youngMints.length,
+        filteredOut: filteredCount,
+        maxAgeHours: this.config.maxTokenAgeHours,
+        sampleYoungMints: youngMints.slice(0, 3)
+      });
+
+      return youngMints;
+      
+    } catch (error) {
+      logger.error('❌ Age filtering failed, returning original mints', {
+        error: error.message,
+        mintCount: mints.length
+      });
+      return mints;
+    }
   }
 
   canMakeRestCall() {
@@ -907,6 +1038,8 @@ class HeliusListener {
     const baseMetrics = {
       totalEvents: this.metrics.totalEvents,
       dedupFiltered: this.metrics.dedupFiltered,
+      ageFiltered: this.metrics.ageFiltered,
+      ageCheckErrors: this.metrics.ageCheckErrors,
       batchesProcessed: this.metrics.batchesProcessed,
       restFallbacks: this.metrics.restFallbacks,
       restFallbackRate: Math.round(restFallbackRate * 100) / 100,
@@ -914,6 +1047,7 @@ class HeliusListener {
       queueSize: this.eventQueue.length,
       cacheSize: this.seenMints.getStats().keys,
       uptimeSeconds,
+      maxTokenAgeHours: this.config.maxTokenAgeHours,
       performance: {
         eventsPerSecond: parseFloat(eventsPerSecond),
         batchesPerMinute: parseFloat(batchesPerMinute)

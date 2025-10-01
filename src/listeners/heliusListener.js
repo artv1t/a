@@ -207,21 +207,38 @@ class HeliusListener {
   async extractMintsFromTokenBalances(postTokenBalances) {
     const mints = new Set();
     
+    // Step 2.4: Enhanced input validation and logging
+    if (!postTokenBalances || !Array.isArray(postTokenBalances)) {
+      logger.debug('⚠️ Step 2.4: No postTokenBalances provided', {
+        hasPostTokenBalances: !!postTokenBalances,
+        isArray: Array.isArray(postTokenBalances),
+        type: typeof postTokenBalances
+      });
+      return [];
+    }
+    
     logger.debug('🔍 Processing postTokenBalances', {
       count: postTokenBalances.length,
       sample: postTokenBalances.slice(0, 2)
     });
+    
+    // Step 2.4: Enhanced balance processing with detailed tracking
+    const validBalances = [];
+    const invalidBalances = [];
     
     for (const balance of postTokenBalances) {
       if (balance.mint) {
         try {
           new PublicKey(balance.mint);
           mints.add(balance.mint);
+          validBalances.push(balance);
           logger.debug('✅ Valid mint found from postTokenBalances', { mint: balance.mint });
         } catch (error) {
+          invalidBalances.push({ mint: balance.mint, error: error.message });
           logger.debug('❌ Invalid mint address in postTokenBalances', { mint: balance.mint, error: error.message });
         }
       } else {
+        invalidBalances.push({ balance, reason: 'missing_mint_field' });
         logger.debug('⚠️ Balance entry missing mint field', { balance });
       }
     }
@@ -229,6 +246,37 @@ class HeliusListener {
     const rawMints = Array.from(mints);
     const interestingMints = this.filterInterestingMints(rawMints);
     const youngMints = await this.filterByAge(interestingMints);
+    
+    // Step 2.4: Comprehensive token balance analysis logging
+    logger.info('🪙 Step 2.4: Token Balance Mint Extraction Analysis', {
+      extraction: {
+        totalBalances: postTokenBalances.length,
+        validBalances: validBalances.length,
+        invalidBalances: invalidBalances.length,
+        rawMints: rawMints.length,
+        interestingMints: interestingMints.length,
+        youngMints: youngMints.length
+      },
+      balanceDetails: validBalances.slice(0, 5).map(balance => ({
+        mint: balance.mint,
+        owner: balance.owner,
+        uiTokenAmount: balance.uiTokenAmount?.uiAmount || 'unknown',
+        decimals: balance.uiTokenAmount?.decimals || 'unknown'
+      })),
+      mintAddresses: {
+        allFound: rawMints,
+        interesting: interestingMints,
+        young: youngMints,
+        filtered: rawMints.filter(mint => !interestingMints.includes(mint))
+      },
+      filteringEfficiency: {
+        interestingFilterRate: rawMints.length > 0 ? 
+          ((rawMints.length - interestingMints.length) / rawMints.length * 100).toFixed(1) + '%' : '0%',
+        ageFilterRate: interestingMints.length > 0 ? 
+          ((interestingMints.length - youngMints.length) / interestingMints.length * 100).toFixed(1) + '%' : '0%'
+      },
+      timestamp: new Date().toISOString()
+    });
     
     logger.debug('🎯 Final extracted mints from postTokenBalances', {
       rawCount: rawMints.length,
@@ -243,10 +291,24 @@ class HeliusListener {
   async extractMintsFromTokenTransfers(tokenTransfers) {
     const mints = new Set();
     
+    // Step 2.4: Enhanced input validation and logging
+    if (!tokenTransfers || !Array.isArray(tokenTransfers)) {
+      logger.debug('⚠️ Step 2.4: No tokenTransfers provided', {
+        hasTokenTransfers: !!tokenTransfers,
+        isArray: Array.isArray(tokenTransfers),
+        type: typeof tokenTransfers
+      });
+      return [];
+    }
+    
     logger.info('🔍 Processing tokenTransfers', {
       count: tokenTransfers.length,
       sample: tokenTransfers.slice(0, 2)
     });
+    
+    // Step 2.4: Enhanced transfer processing with detailed tracking
+    const validTransfers = [];
+    const invalidTransfers = [];
     
     for (const transfer of tokenTransfers) {
       if (transfer.mint) {
@@ -265,6 +327,7 @@ class HeliusListener {
           
           if (this.isValidTokenTransfer(transfer)) {
             mints.add(transfer.mint);
+            validTransfers.push(transfer);
             logger.info('✅ Valid mint found from tokenTransfers', { 
               mint: transfer.mint,
               fromTokenAccount: transfer.fromTokenAccount,
@@ -272,6 +335,10 @@ class HeliusListener {
               tokenAmount: transfer.tokenAmount
             });
           } else {
+            invalidTransfers.push({
+              mint: transfer.mint,
+              reason: this.getTransferInvalidReason(transfer)
+            });
             logger.info('⚠️ Token transfer filtered out by isValidTokenTransfer', { 
               mint: transfer.mint,
               reason: 'invalid_transfer_data',
@@ -279,12 +346,21 @@ class HeliusListener {
             });
           }
         } catch (error) {
+          invalidTransfers.push({
+            mint: transfer.mint,
+            reason: 'invalid_mint_address',
+            error: error.message
+          });
           logger.info('❌ Invalid mint address in tokenTransfers', { 
             mint: transfer.mint, 
             error: error.message 
           });
         }
       } else {
+        invalidTransfers.push({
+          transfer,
+          reason: 'missing_mint_field'
+        });
         logger.info('⚠️ Transfer entry missing mint field', { transfer });
       }
     }
@@ -292,6 +368,40 @@ class HeliusListener {
     const rawMints = Array.from(mints);
     const interestingMints = this.filterInterestingMints(rawMints);
     const youngMints = await this.filterByAge(interestingMints);
+    
+    // Step 2.4: Comprehensive token transfer analysis logging
+    logger.info('🔄 Step 2.4: Token Transfer Mint Extraction Analysis', {
+      transferAnalysis: {
+        totalTransfers: tokenTransfers.length,
+        validTransfers: validTransfers.length,
+        invalidTransfers: invalidTransfers.length,
+        rawMints: rawMints.length,
+        interestingMints: interestingMints.length,
+        youngMints: youngMints.length
+      },
+      validTransferDetails: validTransfers.slice(0, 3).map(transfer => ({
+        mint: transfer.mint,
+        tokenAmount: transfer.tokenAmount,
+        fromAccount: transfer.fromTokenAccount?.substring(0, 8) + '...',
+        toAccount: transfer.toTokenAccount?.substring(0, 8) + '...'
+      })),
+      invalidTransferReasons: invalidTransfers.slice(0, 3),
+      mintAddresses: {
+        allFound: rawMints,
+        interesting: interestingMints,
+        young: youngMints,
+        filtered: rawMints.filter(mint => !interestingMints.includes(mint))
+      },
+      filteringEfficiency: {
+        validationFilterRate: tokenTransfers.length > 0 ? 
+          ((tokenTransfers.length - validTransfers.length) / tokenTransfers.length * 100).toFixed(1) + '%' : '0%',
+        interestingFilterRate: rawMints.length > 0 ? 
+          ((rawMints.length - interestingMints.length) / rawMints.length * 100).toFixed(1) + '%' : '0%',
+        ageFilterRate: interestingMints.length > 0 ? 
+          ((interestingMints.length - youngMints.length) / interestingMints.length * 100).toFixed(1) + '%' : '0%'
+      },
+      timestamp: new Date().toISOString()
+    });
     
     logger.info('🎯 Final extracted mints from tokenTransfers', {
       rawCount: rawMints.length,
@@ -301,6 +411,17 @@ class HeliusListener {
     });
     
     return youngMints;
+  }
+  
+  // Step 2.4: Helper method to get detailed transfer invalid reasons
+  getTransferInvalidReason(transfer) {
+    if (!transfer.mint) return 'missing_mint';
+    if (transfer.mint === 'So11111111111111111111111111111111111111112') return 'sol_transfer';
+    if (transfer.tokenAmount === undefined || transfer.tokenAmount === null) return 'missing_token_amount';
+    if (typeof transfer.tokenAmount === 'number' && transfer.tokenAmount <= 0) return 'zero_or_negative_amount';
+    if (!transfer.fromTokenAccount) return 'missing_from_account';
+    if (!transfer.toTokenAccount) return 'missing_to_account';
+    return 'unknown_reason';
   }
 
   isValidTokenTransfer(transfer) {
@@ -897,16 +1018,72 @@ class HeliusListener {
       const allMints = new Set();
       const signatures = new Set();
       const eventSources = {};
+      const mintDetails = [];
       
+      // Step 2.4: Enhanced mint address tracking with detailed information
       for (const event of batch) {
         signatures.add(event.signature);
         for (const mint of event.mints) {
           allMints.add(mint);
+          mintDetails.push({
+            mint,
+            signature: event.signature,
+            source: event.source || 'unknown',
+            timestamp: event.timestamp,
+            ageFiltered: event.ageFiltered || false
+          });
         }
         
         const source = event.source || 'unknown';
         eventSources[source] = (eventSources[source] || 0) + 1;
       }
+      
+      // Step 2.4: Detailed mint address logging with comprehensive statistics
+      const uniqueMints = Array.from(allMints);
+      const mintsBySource = {};
+      mintDetails.forEach(detail => {
+        if (!mintsBySource[detail.source]) {
+          mintsBySource[detail.source] = [];
+        }
+        mintsBySource[detail.source].push(detail.mint);
+      });
+      
+      logger.info('🪙 Step 2.4: Detailed Mint Address Analysis', {
+        batchNumber: this.metrics.batchesProcessed + 1,
+        totalUniqueMintsFound: uniqueMints.length,
+        totalMintInstances: mintDetails.length,
+        uniqueSignatures: signatures.size,
+        mintsBySource: Object.keys(mintsBySource).map(source => ({
+          source,
+          mintCount: mintsBySource[source].length,
+          uniqueMints: [...new Set(mintsBySource[source])].length
+        })),
+        sampleMintDetails: mintDetails.slice(0, 3).map(detail => ({
+          mint: detail.mint,
+          signature: detail.signature.substring(0, 8) + '...',
+          source: detail.source,
+          ageFiltered: detail.ageFiltered
+        })),
+        allFoundMints: uniqueMints.slice(0, 10),
+        processingTimeMs: Date.now() - startTime
+      });
+      
+      // Step 2.4: Enhanced batch statistics
+      const batchStats = {
+        batchId: this.metrics.batchesProcessed + 1,
+        eventCount: batch.length,
+        uniqueSignatures: signatures.size,
+        totalMintInstances: mintDetails.length,
+        uniqueMintsFound: uniqueMints.length,
+        deduplicationEfficiency: mintDetails.length > 0 ? 
+          ((mintDetails.length - uniqueMints.length) / mintDetails.length * 100).toFixed(1) + '%' : '0%',
+        sourceDistribution: eventSources,
+        avgMintsPerEvent: batch.length > 0 ? (mintDetails.length / batch.length).toFixed(2) : '0',
+        processingLatency: Date.now() - startTime,
+        timestamp: new Date().toISOString()
+      };
+      
+      logger.info('📊 Step 2.4: Enhanced Batch Statistics', batchStats);
       
       logger.debug('🎯 Batch mint extraction results', {
         totalMintsFromEvents: allMints.size,
@@ -920,7 +1097,9 @@ class HeliusListener {
         mints: Array.from(allMints),
         signatures: Array.from(signatures),
         eventCount: batch.length,
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        mintDetails: mintDetails,
+        batchStats: batchStats
       };
       
       const processingTime = Date.now() - startTime;
@@ -928,45 +1107,60 @@ class HeliusListener {
         mintCount: allMints.size,
         signatureCount: signatures.size,
         batchNumber: this.metrics.batchesProcessed + 1,
-        eventSources
+        eventSources,
+        enhancedStats: batchStats
       });
       
       for (const handler of this.eventHandlers) {
         try {
           logger.debug('📤 Calling batch handler', {
             mintCount: allMints.size,
-            eventCount: batch.length
+            eventCount: batch.length,
+            handlerName: handler.name || 'anonymous'
           });
           await handler(batchData);
         } catch (error) {
           logger.error('Batch handler failed', { 
             error: error.message,
-            stack: error.stack
+            stack: error.stack,
+            handlerName: handler.name || 'anonymous'
           });
         }
       }
       
       this.metrics.batchesProcessed++;
       
-      logger.debug('✅ Batch processing completed', {
+      // Step 2.4: Enhanced completion logging with debug information
+      logger.info('✅ Step 2.4: Batch Processing Completed Successfully', {
         batchNumber: this.metrics.batchesProcessed,
         totalProcessingTimeMs: Date.now() - startTime,
         mintCount: allMints.size,
-        eventCount: batch.length
+        eventCount: batch.length,
+        efficiency: {
+          msPerEvent: batch.length > 0 ? ((Date.now() - startTime) / batch.length).toFixed(2) : '0',
+          msPerMint: allMints.size > 0 ? ((Date.now() - startTime) / allMints.size).toFixed(2) : '0'
+        },
+        memoryUsage: {
+          queueSize: this.eventQueue.length,
+          cacheSize: this.seenMints.getStats().keys,
+          heapUsed: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB'
+        }
       });
       
     } catch (error) {
       logger.error('Batch processing failed', { 
         error: error.message,
         stack: error.stack,
-        batchSize: batch.length
+        batchSize: batch.length,
+        batchNumber: this.metrics.batchesProcessed + 1
       });
     } finally {
       this.isProcessingBatch = false;
       
       if (this.eventQueue.length > 0) {
         logger.debug('🔄 Scheduling next batch processing', {
-          remainingQueueSize: this.eventQueue.length
+          remainingQueueSize: this.eventQueue.length,
+          nextBatchNumber: this.metrics.batchesProcessed + 2
         });
         this.scheduleBatchProcessing();
       }
@@ -1030,10 +1224,32 @@ class HeliusListener {
       ? this.metrics.restFallbacks / this.metrics.totalEvents 
       : 0;
     
-    // Step 2.2 Enhancement: Comprehensive metrics with performance indicators
+    // Step 2.4 Enhancement: Comprehensive metrics with detailed debug information
     const uptimeSeconds = Math.floor((now - this.metrics.startTime) / 1000);
     const eventsPerSecond = uptimeSeconds > 0 ? (this.metrics.totalEvents / uptimeSeconds).toFixed(2) : '0.00';
     const batchesPerMinute = uptimeSeconds > 60 ? ((this.metrics.batchesProcessed / uptimeSeconds) * 60).toFixed(2) : '0.00';
+    const avgEventsPerBatch = this.metrics.batchesProcessed > 0 ? (this.metrics.totalEvents / this.metrics.batchesProcessed).toFixed(2) : '0.00';
+    
+    // Step 2.4: Enhanced system health and performance metrics
+    const memUsage = process.memoryUsage();
+    const systemMetrics = {
+      memory: {
+        heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024) + 'MB',
+        heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024) + 'MB',
+        external: Math.round(memUsage.external / 1024 / 1024) + 'MB',
+        rss: Math.round(memUsage.rss / 1024 / 1024) + 'MB'
+      },
+      uptime: {
+        seconds: uptimeSeconds,
+        formatted: this.formatUptime(uptimeSeconds)
+      },
+      websocket: {
+        isConnected: this.isConnected,
+        reconnectAttempts: this.reconnectAttempts,
+        lastMessageTime: this.lastMessageTime ? new Date(this.lastMessageTime).toISOString() : null,
+        timeSinceLastMessage: this.lastMessageTime ? Math.round((now - this.lastMessageTime) / 1000) + 's' : null
+      }
+    };
     
     const baseMetrics = {
       totalEvents: this.metrics.totalEvents,
@@ -1050,8 +1266,16 @@ class HeliusListener {
       maxTokenAgeHours: this.config.maxTokenAgeHours,
       performance: {
         eventsPerSecond: parseFloat(eventsPerSecond),
-        batchesPerMinute: parseFloat(batchesPerMinute)
-      }
+        batchesPerMinute: parseFloat(batchesPerMinute),
+        avgEventsPerBatch: parseFloat(avgEventsPerBatch),
+        efficiency: {
+          dedupEfficiency: this.metrics.totalEvents > 0 ? 
+            ((this.metrics.dedupFiltered / this.metrics.totalEvents) * 100).toFixed(1) + '%' : '0%',
+          ageFilterEfficiency: this.metrics.totalEvents > 0 ? 
+            ((this.metrics.ageFiltered / this.metrics.totalEvents) * 100).toFixed(1) + '%' : '0%'
+        }
+      },
+      systemHealth: systemMetrics
     };
 
     // Add REST call stats if available
@@ -1065,11 +1289,34 @@ class HeliusListener {
         failedCalls: this.metrics.restCallStats.failedCalls,
         successRate: successRate + '%',
         averageResponseTime: this.metrics.restCallStats.averageResponseTime,
-        lastCallTime: this.metrics.restCallStats.lastCallTime
+        lastCallTime: this.metrics.restCallStats.lastCallTime,
+        callsPerMinute: uptimeSeconds > 60 ? 
+          ((this.metrics.restCallStats.totalCalls / uptimeSeconds) * 60).toFixed(2) : '0.00'
       };
     }
     
-    logger.info('📊 Helius Listener Enhanced Metrics', baseMetrics);
+    // Step 2.4: Enhanced debug information logging
+    logger.info('📊 Step 2.4: Comprehensive Helius Listener Metrics & Debug Info', baseMetrics);
+    
+    // Step 2.4: Additional debug logging for troubleshooting
+    logger.debug('🔧 Step 2.4: Detailed Debug Information', {
+      configSnapshot: {
+        batchWindowMs: this.config.batchWindowMs,
+        dedupTtlS: this.config.dedupTtlS,
+        restFallbackLimit: this.config.restFallbackLimit,
+        maxTokenAgeHours: this.config.maxTokenAgeHours,
+        maxBacklog: this.config.maxBacklog
+      },
+      internalState: {
+        isProcessingBatch: this.isProcessingBatch,
+        eventQueueLength: this.eventQueue.length,
+        batchTimerActive: !!this.batchTimer,
+        subscriptionId: this.subscriptionId,
+        wsReadyState: this.ws ? this.ws.readyState : null
+      },
+      cacheDetails: this.seenMints.getStats(),
+      recentRestCalls: this.restCallTimes.slice(-5).map(time => new Date(time).toISOString())
+    });
     
     // Step 2.2 Enhancement: Health warnings based on metrics
     if (this.metrics.batchesProcessed > 10) {
@@ -1088,6 +1335,37 @@ class HeliusListener {
         restFallbackRate: (restFallbackRate * 100).toFixed(1) + '%',
         possibleCauses: ['websocket_missing_data', 'api_limitations', 'network_issues']
       });
+    }
+    
+    // Step 2.4: Additional health checks and warnings
+    if (this.eventQueue.length > this.config.maxBacklog * 0.8) {
+      logger.warn('⚠️ Event queue approaching capacity', {
+        currentSize: this.eventQueue.length,
+        maxCapacity: this.config.maxBacklog,
+        utilizationPercent: ((this.eventQueue.length / this.config.maxBacklog) * 100).toFixed(1) + '%'
+      });
+    }
+    
+    if (memUsage.heapUsed > 500 * 1024 * 1024) { // 500MB
+      logger.warn('⚠️ High memory usage detected', {
+        heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024) + 'MB',
+        recommendation: 'Consider restarting if memory continues to grow'
+      });
+    }
+  }
+  
+  // Step 2.4: Helper method for formatting uptime
+  formatUptime(seconds) {
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const secs = seconds % 60;
+    
+    if (hours > 0) {
+      return `${hours}h ${minutes}m ${secs}s`;
+    } else if (minutes > 0) {
+      return `${minutes}m ${secs}s`;
+    } else {
+      return `${secs}s`;
     }
   }
 

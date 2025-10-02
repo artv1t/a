@@ -11,9 +11,10 @@ class HeliusListener {
       wsUrl: process.env.HELIUS_WS || config.wsUrl,
       rpcUrl: process.env.HELIUS_RPC || config.rpcUrl,
       parseUrl: process.env.HELIUS_PARSE_TX || config.parseUrl,
-      batchWindowMs: parseInt(process.env.BATCH_WINDOW_MS) || 300,
+      batchWindowMs: parseInt(process.env.BATCH_WINDOW_MS) || 200,
       dedupTtlS: parseInt(process.env.DEDUP_TTL_S) || 30,
-      restFallbackLimit: parseInt(process.env.REST_FALLBACK_LIMIT_PER_SEC) || 5,
+      restFallbackLimit: parseInt(process.env.REST_FALLBACK_LIMIT_PER_SEC) || 2,
+      maxBatchSize: parseInt(process.env.MAX_BATCH_SIZE) || 50,
       maxBacklog: parseInt(process.env.MAX_BACKLOG_EVENTS) || 10000,
       maxReconnectDelay: parseInt(process.env.WS_RECONNECT_MAX_DELAY_S) || 60,
       maxTokenAgeHours: parseFloat(process.env.MAX_TOKEN_AGE_HOURS) || 1.5,
@@ -894,7 +895,15 @@ class HeliusListener {
       timestamp: Date.now()
     });
     
-    this.scheduleSignatureBatchProcessing();
+    if (this.signatureQueue.length >= this.config.maxBatchSize) {
+      logger.debug('🚀 Batch size limit reached, processing immediately', {
+        queueSize: this.signatureQueue.length,
+        maxBatchSize: this.config.maxBatchSize
+      });
+      this.processSignatureBatch();
+    } else {
+      this.scheduleSignatureBatchProcessing();
+    }
   }
 
   scheduleSignatureBatchProcessing() {
@@ -915,20 +924,21 @@ class HeliusListener {
     this.isProcessingSignatureBatch = true;
     this.signatureBatchTimer = null;
     
-    const batch = [...this.signatureQueue];
-    this.signatureQueue = [];
+    const batchToProcess = this.signatureQueue.splice(0, this.config.maxBatchSize);
     
     logger.info('🔄 Processing signature batch', {
-      batchSize: batch.length,
+      batchSize: batchToProcess.length,
+      remainingInQueue: this.signatureQueue.length,
+      maxBatchSize: this.config.maxBatchSize,
       rateLimitAllows: this.config.restFallbackLimit
     });
     
-    const signaturestoProcess = batch.slice(0, this.config.restFallbackLimit);
+    const signaturestoProcess = batchToProcess.slice(0, this.config.restFallbackLimit);
     
     for (const item of signaturestoProcess) {
       if (this.canMakeRestCall()) {
         await this.scheduleRestFallback(item.signature);
-        await new Promise(resolve => setTimeout(resolve, 200));
+        await new Promise(resolve => setTimeout(resolve, 500)); // Increased delay for rate limiting
       } else {
         logger.debug('⚠️ Skipping signature due to rate limit', { signature: item.signature });
         break;

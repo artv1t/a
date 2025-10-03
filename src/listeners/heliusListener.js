@@ -11,13 +11,15 @@ class HeliusListener {
       wsUrl: process.env.HELIUS_WS || config.wsUrl,
       rpcUrl: process.env.HELIUS_RPC || config.rpcUrl,
       parseUrl: process.env.HELIUS_PARSE_TX || config.parseUrl,
-      batchWindowMs: parseInt(process.env.BATCH_WINDOW_MS) || 200,
-      dedupTtlS: parseInt(process.env.DEDUP_TTL_S) || 30,
-      restFallbackLimit: parseInt(process.env.REST_FALLBACK_LIMIT_PER_SEC) || 2,
-      maxBatchSize: parseInt(process.env.MAX_BATCH_SIZE) || 50,
-      maxBacklog: parseInt(process.env.MAX_BACKLOG_EVENTS) || 10000,
+      batchWindowMs: parseInt(process.env.BATCH_WINDOW_MS) || 2000,
+      dedupTtlS: parseInt(process.env.DEDUP_TTL_S) || 60,
+      restFallbackLimit: parseInt(process.env.REST_FALLBACK_LIMIT_PER_SEC) || 1,
+      maxBatchSize: parseInt(process.env.MAX_BATCH_SIZE) || 25,
+      maxBacklog: parseInt(process.env.MAX_BACKLOG_EVENTS) || 5000,
       maxReconnectDelay: parseInt(process.env.WS_RECONNECT_MAX_DELAY_S) || 60,
       maxTokenAgeHours: parseFloat(process.env.MAX_TOKEN_AGE_HOURS) || 1.5,
+      processingDelayMs: parseInt(process.env.PROCESSING_DELAY_MS) || 1000,
+      interBatchDelayMs: parseInt(process.env.INTER_BATCH_DELAY_MS) || 3000,
       ...config
     };
 
@@ -828,42 +830,18 @@ class HeliusListener {
     
     this.restCallTimes = this.restCallTimes.filter(time => time > oneSecondAgo);
     
-    // Step 2.2 Enhancement: Burst capacity with sustained rate limiting
-    const burstCapacity = Math.min(this.config.restFallbackLimit * 2, 15);
-    const sustainedLimit = this.config.restFallbackLimit;
-    
-    // Allow burst for first few calls, then enforce sustained rate
     const recentCalls = this.restCallTimes.length;
-    const canBurst = recentCalls < burstCapacity;
-    const withinSustainedRate = recentCalls < sustainedLimit;
+    const maxCallsPerSecond = this.config.restFallbackLimit;
+    const withinRateLimit = recentCalls < maxCallsPerSecond;
     
-    // If we have made many calls recently, check longer window for sustained rate
-    if (recentCalls >= sustainedLimit) {
-      const longerWindowStart = now - 5000; // 5 second window
-      const longerWindowCalls = this.restCallTimes.filter(time => time > longerWindowStart).length;
-      const sustainedRateOk = longerWindowCalls < (sustainedLimit * 5);
-      
-      logger.debug('🚦 REST rate limit check - sustained rate', {
-        recentCalls,
-        longerWindowCalls,
-        sustainedLimit,
-        sustainedRateOk,
-        burstCapacity
-      });
-      
-      return sustainedRateOk;
-    }
-    
-    logger.debug('🚦 REST rate limit check', {
+    logger.debug('🚦 Stage 2 Optimized REST rate limit check', {
       recentCalls,
-      sustainedLimit,
-      burstCapacity,
-      canBurst,
-      withinSustainedRate,
-      allowed: canBurst || withinSustainedRate
+      maxCallsPerSecond,
+      withinRateLimit,
+      totalRecentCalls: this.restCallTimes.length
     });
     
-    return canBurst || withinSustainedRate;
+    return withinRateLimit;
   }
 
   recordRestCall() {
@@ -926,29 +904,34 @@ class HeliusListener {
     
     const batchToProcess = this.signatureQueue.splice(0, this.config.maxBatchSize);
     
-    logger.info('🔄 Processing signature batch', {
+    logger.info('🔄 Processing signature batch (Stage 2 Optimized)', {
       batchSize: batchToProcess.length,
       remainingInQueue: this.signatureQueue.length,
       maxBatchSize: this.config.maxBatchSize,
-      rateLimitAllows: this.config.restFallbackLimit
+      rateLimitAllows: this.config.restFallbackLimit,
+      processingDelayMs: this.config.processingDelayMs
     });
     
-    const signaturestoProcess = batchToProcess.slice(0, this.config.restFallbackLimit);
+    const signaturestoProcess = batchToProcess.slice(0, 1);
     
     for (const item of signaturestoProcess) {
       if (this.canMakeRestCall()) {
         await this.scheduleRestFallback(item.signature);
-        await new Promise(resolve => setTimeout(resolve, 500)); // Increased delay for rate limiting
+        await new Promise(resolve => setTimeout(resolve, 1000));
       } else {
         logger.debug('⚠️ Skipping signature due to rate limit', { signature: item.signature });
         break;
       }
     }
     
+    await new Promise(resolve => setTimeout(resolve, this.config.processingDelayMs));
+    
     this.isProcessingSignatureBatch = false;
     
     if (this.signatureQueue && this.signatureQueue.length > 0) {
-      this.scheduleSignatureBatchProcessing();
+      setTimeout(() => {
+        this.scheduleSignatureBatchProcessing();
+      }, this.config.interBatchDelayMs);
     }
   }
 
@@ -1012,6 +995,8 @@ class HeliusListener {
     
     this.isProcessingBatch = true;
     this.batchTimer = null;
+    
+    await new Promise(resolve => setTimeout(resolve, this.config.processingDelayMs / 2));
     
     const startTime = Date.now();
     const batch = [...this.eventQueue];
@@ -1168,11 +1153,14 @@ class HeliusListener {
       this.isProcessingBatch = false;
       
       if (this.eventQueue.length > 0) {
-        logger.debug('🔄 Scheduling next batch processing', {
+        logger.debug('🔄 Scheduling next batch processing (Stage 2 Optimized)', {
           remainingQueueSize: this.eventQueue.length,
-          nextBatchNumber: this.metrics.batchesProcessed + 2
+          nextBatchNumber: this.metrics.batchesProcessed + 2,
+          delayMs: this.config.interBatchDelayMs
         });
-        this.scheduleBatchProcessing();
+        setTimeout(() => {
+          this.scheduleBatchProcessing();
+        }, this.config.interBatchDelayMs);
       }
     }
   }

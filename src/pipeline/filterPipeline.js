@@ -1,5 +1,6 @@
 const logger = require('../utils/logging');
 const DedupFilter = require('../filters/01_dedup');
+const SanityFilter = require('../filters/02_sanity');
 
 class FilterPipeline {
   constructor() {
@@ -8,7 +9,8 @@ class FilterPipeline {
     this.scoreThreshold = parseFloat(process.env.FILTER_SCORE_THRESHOLD) || 0.0;
     
     this.filters = [
-      new DedupFilter()
+      new DedupFilter(),
+      new SanityFilter()
     ];
     
     this.stats = {

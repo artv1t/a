@@ -1,6 +1,7 @@
 const logger = require('../utils/logging');
 const DedupFilter = require('../filters/01_dedup');
 const SanityFilter = require('../filters/02_sanity');
+const RenouncedFilter = require('../filters/03_renounced');
 
 class FilterPipeline {
   constructor() {
@@ -10,7 +11,8 @@ class FilterPipeline {
     
     this.filters = [
       new DedupFilter(),
-      new SanityFilter()
+      new SanityFilter(),
+      new RenouncedFilter()
     ];
     
     this.stats = {

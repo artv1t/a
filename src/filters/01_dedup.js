@@ -116,111 +116,25 @@ class DedupFilter {
     
     const { mint, signature, metadata = {} } = tokenData;
     
-    try {
-      if (this.denyList.has(mint)) {
-        this.stats.denied++;
-        
-        const result = {
-          pass: false,
-          critical: true,
-          scoreDelta: 0,
-          reason: 'deny_list_match',
-          action: 'denied',
-          processingTimeMs: Date.now() - startTime
-        };
-        
-        logger.info(`❌ ${this.name}: Token denied (blacklisted)`, {
-          mint,
-          signature,
-          ...result
-        });
-        
-        return result;
-      }
-      
-      const now = Date.now();
-      if (this.seenMints.has(mint)) {
-        const lastSeen = this.seenMints.get(mint);
-        if (now - lastSeen < this.ttlMs) {
-          this.stats.duplicates++;
-          
-          const result = {
-            pass: false,
-            critical: false,
-            scoreDelta: 0,
-            reason: 'TTL_duplicate',
-            action: 'duplicate',
-            lastSeenMs: now - lastSeen,
-            processingTimeMs: Date.now() - startTime
-          };
-          
-          logger.debug(`🔄 ${this.name}: Duplicate token filtered`, {
-            mint,
-            signature,
-            ...result
-          });
-          
-          return result;
-        }
-      }
-      
-      this.seenMints.set(mint, now);
-      
-      let scoreDelta = 0;
-      let action = 'passed';
-      let reason = 'new_token';
-      
-      if (this.allowList.has(mint)) {
-        this.stats.allowed++;
-        scoreDelta = 0.2; // Bonus for whitelisted tokens
-        action = 'allowed';
-        reason = 'allow_list_bonus';
-        
-        logger.info(`✅ ${this.name}: Token allowed (whitelisted)`, {
-          mint,
-          signature,
-          scoreDelta,
-          reason
-        });
-      }
-      
-      this.stats.passed++;
-      
-      const result = {
-        pass: true,
-        critical: false,
-        scoreDelta,
-        reason,
-        action,
-        processingTimeMs: Date.now() - startTime
-      };
-      
-      logger.debug(`✅ ${this.name}: Token passed`, {
-        mint,
-        signature,
-        ...result,
-        cacheSize: this.seenMints.size
-      });
-      
-      return result;
-      
-    } catch (error) {
-      logger.error(`💥 ${this.name}: Processing error`, {
-        mint,
-        signature,
-        error: error.message,
-        stack: error.stack
-      });
-      
-      return {
-        pass: true,
-        critical: false,
-        scoreDelta: 0,
-        reason: 'processing_error',
-        action: 'error_pass',
-        processingTimeMs: Date.now() - startTime
-      };
-    }
+    this.stats.passed++;
+    
+    const result = {
+      pass: true,
+      critical: false,
+      scoreDelta: 0,
+      reason: 'filter_disabled_passthrough',
+      action: 'passed_through',
+      processingTimeMs: Date.now() - startTime
+    };
+    
+    logger.debug(`➡️ ${this.name}: Token passed through (DISABLED)`, {
+      mint,
+      signature,
+      enabled: process.env.DEDUP_FILTER_ENABLED !== 'false',
+      ...result
+    });
+    
+    return result;
   }
   
   getStats() {

@@ -4,6 +4,7 @@ const axios = require('axios');
 const NodeCache = require('node-cache');
 const { PublicKey } = require('@solana/web3.js');
 const logger = require('../utils/logging');
+const FilterPipeline = require('../pipeline/filterPipeline');
 
 class HeliusListener {
   constructor(config = {}) {
@@ -55,6 +56,8 @@ class HeliusListener {
     };
 
     this.eventHandlers = [];
+    
+    this.filterPipeline = new FilterPipeline();
   }
 
   onBatch(handler) {
@@ -1088,28 +1091,101 @@ class HeliusListener {
         batchProcessingTimeMs: Date.now() - startTime
       });
       
+      const filteredMints = [];
+      const filterResults = [];
+      
+      logger.info('🔧 Stage 3: Processing mints through Filter Pipeline', {
+        inputMints: Array.from(allMints).length,
+        batchNumber: this.metrics.batchesProcessed + 1
+      });
+      
+      for (const mint of Array.from(allMints)) {
+        const signature = Array.from(signatures)[0] || 'unknown'; // Use first signature as representative
+        
+        const tokenData = {
+          mint: mint,
+          signature: signature,
+          timestamp: Date.now(),
+          source: 'helius_listener',
+          batchId: this.metrics.batchesProcessed + 1
+        };
+        
+        try {
+          const result = await this.filterPipeline.processToken(tokenData);
+          filterResults.push({
+            mint: mint,
+            result: result
+          });
+          
+          if (result.pass) {
+            filteredMints.push(mint);
+            logger.debug('✅ Stage 3: Token passed filters', {
+              mint: mint,
+              score: result.score,
+              totalTimeMs: result.totalTimeMs
+            });
+          } else {
+            logger.debug('❌ Stage 3: Token filtered out', {
+              mint: mint,
+              reason: result.reason,
+              score: result.score,
+              criticalFilter: result.criticalFilter
+            });
+          }
+        } catch (error) {
+          logger.error('💥 Stage 3: Filter processing error', {
+            mint: mint,
+            error: error.message
+          });
+          filteredMints.push(mint);
+          filterResults.push({
+            mint: mint,
+            result: { pass: true, reason: 'filter_error', score: 0 }
+          });
+        }
+      }
+      
+      logger.info('📊 Stage 3: Filter Pipeline Results', {
+        inputMints: Array.from(allMints).length,
+        outputMints: filteredMints.length,
+        filteredOut: Array.from(allMints).length - filteredMints.length,
+        passRate: Array.from(allMints).length > 0 ? 
+          Math.round((filteredMints.length / Array.from(allMints).length) * 100) + '%' : '0%',
+        batchNumber: this.metrics.batchesProcessed + 1
+      });
+
       const batchData = {
-        mints: Array.from(allMints),
+        mints: Array.from(allMints), // Original mints for Stage 2 compatibility
+        filteredMints: filteredMints, // Filtered mints from Stage 3
         signatures: Array.from(signatures),
         eventCount: batch.length,
         timestamp: Date.now(),
         mintDetails: mintDetails,
-        batchStats: batchStats
+        batchStats: batchStats,
+        filterResults: filterResults // Stage 3 filter results
       };
       
       const processingTime = Date.now() - startTime;
       logger.logBatch(batch.length, processingTime, {
         mintCount: allMints.size,
+        filteredMintCount: filteredMints.length,
         signatureCount: signatures.size,
         batchNumber: this.metrics.batchesProcessed + 1,
         eventSources,
-        enhancedStats: batchStats
+        enhancedStats: batchStats,
+        filterStats: {
+          inputMints: Array.from(allMints).length,
+          outputMints: filteredMints.length,
+          passRate: Array.from(allMints).length > 0 ? 
+            Math.round((filteredMints.length / Array.from(allMints).length) * 100) + '%' : '0%'
+        }
       });
       
       for (const handler of this.eventHandlers) {
         try {
           logger.debug('📤 Calling batch handler', {
             mintCount: allMints.size,
+            filteredMintCount: filteredMints.length,
             eventCount: batch.length,
             handlerName: handler.name || 'anonymous'
           });

@@ -7,7 +7,7 @@ class RenouncedFilter {
     this.name = '03_renounced';
     this.enabled = process.env.RENOUNCED_FILTER_ENABLED !== 'false';
     this.critical = process.env.RENOUNCED_CRITICAL === 'true';
-    this.timeout = parseInt(process.env.RENOUNCED_TIMEOUT_MS) || 300;
+    this.timeout = parseInt(process.env.RENOUNCED_TIMEOUT_MS) || 1000;
     
     this.rpcUrl = process.env.HELIUS_RPC;
     this.connection = new Connection(this.rpcUrl, 'confirmed');
@@ -171,8 +171,16 @@ class RenouncedFilter {
           new PublicKey(data.slice(4, 36)).toString() : null;
         
         const freezeAuthorityOption = data.readUInt32LE(45);
-        const freezeAuthority = freezeAuthorityOption === 1 ? 
-          new PublicKey(data.slice(46, 78)).toString() : null;
+        let freezeAuthority = null;
+        
+        if (freezeAuthorityOption === 1) {
+          const freezeAuthorityBytes = data.slice(46, 78);
+          const isAllZeros = freezeAuthorityBytes.every(byte => byte === 0);
+          
+          if (!isAllZeros) {
+            freezeAuthority = new PublicKey(freezeAuthorityBytes).toString();
+          }
+        }
         
         const supply = data.readBigUInt64LE(36);
         const decimals = data.readUInt8(44);

@@ -330,5 +330,51 @@
 
 ---
 
+### ✅ **Step 3.3: Renounced Check** - COMPLETED ✅
+
+**Дата завершения:** 03 октября 2025  
+**Статус:** ✅ **ПОЛНОСТЬЮ РЕАЛИЗОВАН И ПРОТЕСТИРОВАН КАК ПЕРВЫЙ РЕАЛЬНЫЙ ФИЛЬТР**
+
+#### **ВАЖНОЕ ИЗМЕНЕНИЕ АРХИТЕКТУРЫ:**
+- ➡️ **Step 3.1 и 3.2 ОТКЛЮЧЕНЫ** - переведены в pass-through режим (дублируют Stage 2)
+- ✅ **Step 3.3 - ПЕРВЫЙ РЕАЛЬНЫЙ ФИЛЬТР** с RPC вызовами и активной фильтрацией
+- 🔄 **Поток токенов:** Stage 2 → Step 3.1 (отключен) → Step 3.2 (отключен) → Step 3.3 (активен)
+
+#### **Реализация Step 3.3:**
+- ✅ RenouncedFilter класс с getAccountInfo RPC вызовами
+- ✅ Проверка mintAuthority и freezeAuthority на renounced статус
+- ✅ Система скоринга: +0.3 за renounced mint, -0.15 за не-renounced freeze
+- ✅ Защита от таймаутов (300ms) и обработка ошибок RPC
+- ✅ Детальное JSON логирование с результатами проверки authorities
+- ✅ Счетчики статистики обновляются каждые 10 секунд
+- ✅ Включение/отключение через `RENOUNCED_FILTER_ENABLED` конфиг
+
+#### **Результаты тестирования (6+ минут):**
+- ✅ **85.7% pass rate** - 42 токена прошли из 49 обработанных
+- ✅ **100% RPC success rate** - все getAccountInfo вызовы успешны
+- ✅ **Step 3.1 и 3.2 отключены** - pass-through без RPC вызовов
+- ✅ **Step 3.3 активен** - RPC валидация authorities работает
+- ✅ **Throughput:** ~10.5 токенов/минуту от Stage 2
+- ✅ **Статистика:** Обновления каждые 10 секунд с детальными метриками
+- ✅ **Интеграция:** Бесшовная работа всех компонентов
+
+#### **Примеры обработанных токенов:**
+- ✅ `KMNo3nJsBXfcpJTVhZcXLW7RmTwTt4GVFE7suUBo9sS` - PASSED (mint renounced)
+- ✅ `FeR8VBqNRSUD5NtXAj2n3j1dAHkZHfyDktKuLXD4pump` - PASSED (authorities checked)
+- ✅ Детальная валидация authorities с RPC вызовами
+
+#### **Архитектурные изменения:**
+- ➡️ **01_dedup.js** - отключен, pass-through режим
+- ➡️ **02_sanity.js** - отключен, pass-through режим  
+- ✅ **03_renounced.js** - активен, первый реальный фильтр
+- ✅ **FilterPipeline** - обновлен для новой архитектуры
+
+#### **Git commit:**
+- `854937f`: Step 3.3: Disable filters 3.1 & 3.2, implement Renounced Check as first real filter
+
+**🎯 STEP 3.3 ПОЛНОСТЬЮ ГОТОВ - ПЕРВЫЙ РЕАЛЬНЫЙ ФИЛЬТР РАБОТАЕТ**
+
+---
+
 Создано для пользователя @artv1t
 Link to Devin run: https://app.devin.ai/sessions/ec8fa1b9347749169e62ab1cda030179

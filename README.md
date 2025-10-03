@@ -20,7 +20,7 @@
 - [x] 2.6 **КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Оптимизация размера батчей**
 
 ### Шаг 3 🔄 - Pipeline фильтров
-- [ ] 3.1 Dedup + allow/deny
+- [x] 3.1 Dedup + allow/deny ✅ **ЗАВЕРШЕН И ПРОТЕСТИРОВАН**
 - [ ] 3.2 Fast on-chain sanity
 - [ ] 3.3 Renounced check
 - [ ] 3.4 Mutable metadata

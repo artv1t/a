@@ -5,6 +5,7 @@ const RenouncedFilter = require('../filters/03_renounced');
 const MutableFilter = require('../filters/04_mutable');
 const LocalRouteGateFilter = require('../filters/05_localRouteGate');
 const LPProtectionFilter = require('../filters/06_lpProtection');
+const PoolSizeFilter = require('../filters/07_poolSize');
 
 class FilterPipeline {
   constructor() {
@@ -18,7 +19,8 @@ class FilterPipeline {
       new RenouncedFilter(),
       new MutableFilter(),
       new LocalRouteGateFilter(),
-      new LPProtectionFilter()
+      new LPProtectionFilter(),
+      new PoolSizeFilter()
     ];
     
     this.stats = {

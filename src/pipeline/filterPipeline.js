@@ -3,6 +3,7 @@ const DedupFilter = require('../filters/01_dedup');
 const SanityFilter = require('../filters/02_sanity');
 const RenouncedFilter = require('../filters/03_renounced');
 const MutableFilter = require('../filters/04_mutable');
+const LocalRouteGateFilter = require('../filters/05_localRouteGate');
 
 class FilterPipeline {
   constructor() {
@@ -14,7 +15,8 @@ class FilterPipeline {
       new DedupFilter(),
       new SanityFilter(),
       new RenouncedFilter(),
-      new MutableFilter()
+      new MutableFilter(),
+      new LocalRouteGateFilter()
     ];
     
     this.stats = {

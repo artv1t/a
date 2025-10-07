@@ -448,19 +448,23 @@ class HoldersFilter {
   }
   
   async getTokenSupply(mint) {
-    return await this.makeRpcCall('getTokenSupply', [mint]);
+    const mintPubkey = new PublicKey(mint);
+    return await this.makeRpcCall('getTokenSupply', [mintPubkey]);
   }
   
   async getTokenLargestAccounts(mint) {
-    return await this.makeRpcCall('getTokenLargestAccounts', [mint]);
+    const mintPubkey = new PublicKey(mint);
+    return await this.makeRpcCall('getTokenLargestAccounts', [mintPubkey]);
   }
   
   async getAccountInfo(address) {
-    return await this.makeRpcCall('getParsedAccountInfo', [address]);
+    const addressPubkey = new PublicKey(address);
+    return await this.makeRpcCall('getParsedAccountInfo', [addressPubkey]);
   }
   
   async getSignaturesForAddress(address, options = {}) {
-    return await this.makeRpcCall('getSignaturesForAddress', [address, options]);
+    const addressPubkey = new PublicKey(address);
+    return await this.makeRpcCall('getSignaturesForAddress', [addressPubkey, options]);
   }
   
   async makeRpcCall(method, params) {

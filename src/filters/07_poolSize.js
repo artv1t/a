@@ -1,54 +1,58 @@
 
-const { Connection, PublicKey } = require('@solana/web3.js');
 const logger = require('../utils/logging');
 
 class PoolSizeFilter {
   constructor() {
     this.name = '07_poolSize';
-    this.enabled = process.env.POOL_SIZE_FILTER_ENABLED !== 'false';
+    this.enabled = process.env.POOL_SIZE_ENABLED === 'true';
     this.critical = process.env.POOL_SIZE_CRITICAL === 'true';
-    this.timeout = parseInt(process.env.POOL_SIZE_TIMEOUT_MS) || 700;
     
-    this.rpcUrl = process.env.HELIUS_RPC;
-    this.restApiUrl = process.env.HELIUS_TX_HISTORY;
-    this.connection = new Connection(this.rpcUrl, 'confirmed');
+    this.jupiterBaseUrl = process.env.JUP_BASE_URL || 'https://lite-api.jup.ag';
+    this.jupiterQuotePath = process.env.JUP_QUOTE_PATH || '/swap/v1/quote';
+    this.jupiterOutputMint = process.env.JUP_OUTPUT_MINT || 'So11111111111111111111111111111111111111112';
+    this.jupiterSlippageBps = parseInt(process.env.JUP_SLIPPAGE_BPS) || 50;
+    this.jupiterTargetPiBps = parseInt(process.env.JUP_TARGET_PI_BPS) || 600;
+    this.jupiterTimeout = parseInt(process.env.JUP_TIMEOUT_MS) || 2500;
+    this.jupiterRetry = parseInt(process.env.JUP_RETRY) || 1;
     
-    this.minLiqQuote = parseFloat(process.env.POOL_MIN_LIQ_QUOTE) || 1000;
-    this.minVolWindowQuote = parseFloat(process.env.POOL_MIN_VOL_WINDOW_QUOTE) || 200;
-    this.minTurnover = parseFloat(process.env.POOL_MIN_TURNOVER) || 0.5;
-    this.poolSizeMode = process.env.POOLSIZE_MODE || 'BLOCKING';
-    this.lookbackMin = parseInt(process.env.LOOKBACK_MIN) || 5;
-    this.lookbackTxCount = parseInt(process.env.POOL_LOOKBACK_TX_COUNT) || 150;
+    this.elSmallSol = parseFloat(process.env.EL_SMALL_SOL) || 0.02;
+    this.elBigSol = parseFloat(process.env.EL_BIG_SOL) || 0.5;
+    this.elMaxSteps = parseInt(process.env.EL_MAX_STEPS) || 3;
+    this.minElSol = parseFloat(process.env.MIN_EL_SOL) || 0.2;
     
-    this.quoteTokens = [
-      'So11111111111111111111111111111111111111112', // SOL
-      'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
-      'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB'  // USDT
-    ];
+    this.volumeCheckEnabled = process.env.V_CHECK_ENABLED === 'true';
+    this.volumeWindowMin = parseInt(process.env.V_WINDOW_MIN) || 5;
+    this.volumeMaxTx = parseInt(process.env.V_MAX_TX) || 80;
+    this.volumeMinSwaps = parseInt(process.env.V_MIN_SWAPS) || 3;
     
-    this.ammPrograms = [
-      '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8', // Raydium AMM
-      'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', // Raydium CLMM
-      '9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP', // Orca
-      'Dooar9JkhdZ7J3LHN3A7YCuoGRUggXhQaG4kijfLGU2j'  // Meteora
-    ];
+    this.heliusRpc = process.env.HELIUS_RPC;
+    this.heliusTxHistory = process.env.HELIUS_TX_HISTORY;
+    this.heliusRpsMax = parseInt(process.env.HELIUS_RPS_MAX) || 3;
+    this.heliusTimeout = parseInt(process.env.HELIUS_TIMEOUT_MS) || 1200;
     
-    this.poolCache = new Map();
-    this.volumeCache = new Map();
+    this.jupiterCache = new Map();
+    this.jupiterCacheTtl = parseInt(process.env.JUP_CACHE_TTL_MS) || 60000;
+    
+    this.requestQueue = [];
+    this.activeRequests = 0;
+    this.maxConcurrency = parseInt(process.env.JUP_CONCURRENCY) || 2;
+    this.qpsMax = parseInt(process.env.JUP_QPS_MAX) || 3;
+    this.lastRequestTime = 0;
     
     this.stats = {
       processed: 0,
       passed: 0,
       failed: 0,
-      poolsFound: 0,
-      noPoolsFound: 0,
-      lowLiquidity: 0,
-      lowVolume: 0,
-      lowTurnover: 0,
-      rpcErrors: 0,
+      warn: 0,
+      avg_latency_ms: 0,
+      jup_calls: 0,
+      cache_hits: 0,
+      jup_429: 0,
       timeouts: 0,
-      cacheHits: 0,
-      cacheMisses: 0,
+      no_route: 0,
+      el_low: 0,
+      el_ok: 0,
+      volume_low: 0,
       startTime: Date.now()
     };
     
@@ -57,14 +61,13 @@ class PoolSizeFilter {
     logger.info(`💰 ${this.name}: Pool Size Filter initialized`, {
       enabled: this.enabled,
       critical: this.critical,
-      timeout: this.timeout,
-      minLiqQuote: this.minLiqQuote,
-      minVolWindowQuote: this.minVolWindowQuote,
-      minTurnover: this.minTurnover,
-      poolSizeMode: this.poolSizeMode,
-      lookbackMin: this.lookbackMin,
-      lookbackTxCount: this.lookbackTxCount,
-      rpcUrl: this.rpcUrl ? 'configured' : 'missing'
+      jupiterBaseUrl: this.jupiterBaseUrl,
+      elSmallSol: this.elSmallSol,
+      elBigSol: this.elBigSol,
+      minElSol: this.minElSol,
+      volumeCheckEnabled: this.volumeCheckEnabled,
+      qpsMax: this.qpsMax,
+      maxConcurrency: this.maxConcurrency
     });
   }
   
@@ -78,6 +81,10 @@ class PoolSizeFilter {
     const runtime = Date.now() - this.stats.startTime;
     const runtimeMinutes = runtime / 60000;
     
+    if (this.stats.processed > 0) {
+      this.stats.avg_latency_ms = Math.round(this.stats.avg_latency_ms);
+    }
+    
     const statsData = {
       filter: this.name,
       enabled: this.enabled,
@@ -89,21 +96,20 @@ class PoolSizeFilter {
         processed: this.stats.processed,
         passed: this.stats.passed,
         failed: this.stats.failed,
-        poolsFound: this.stats.poolsFound,
-        noPoolsFound: this.stats.noPoolsFound,
-        lowLiquidity: this.stats.lowLiquidity,
-        lowVolume: this.stats.lowVolume,
-        lowTurnover: this.stats.lowTurnover,
-        rpcErrors: this.stats.rpcErrors,
+        warn: this.stats.warn,
+        avg_latency_ms: this.stats.avg_latency_ms,
+        jup_calls: this.stats.jup_calls,
+        cache_hits: this.stats.cache_hits,
+        jup_429: this.stats.jup_429,
         timeouts: this.stats.timeouts,
-        cacheHits: this.stats.cacheHits,
-        cacheMisses: this.stats.cacheMisses,
+        no_route: this.stats.no_route,
+        el_low: this.stats.el_low,
+        el_ok: this.stats.el_ok,
+        volume_low: this.stats.volume_low,
         passRate: this.stats.processed > 0 ? 
           Math.round((this.stats.passed / this.stats.processed) * 1000) / 10 + '%' : '0%',
-        poolFoundRate: this.stats.processed > 0 ? 
-          Math.round((this.stats.poolsFound / this.stats.processed) * 1000) / 10 + '%' : '0%',
-        cacheHitRate: (this.stats.cacheHits + this.stats.cacheMisses) > 0 ? 
-          Math.round((this.stats.cacheHits / (this.stats.cacheHits + this.stats.cacheMisses)) * 1000) / 10 + '%' : '0%'
+        cacheHitRate: (this.stats.cache_hits + this.stats.jup_calls) > 0 ? 
+          Math.round((this.stats.cache_hits / (this.stats.cache_hits + this.stats.jup_calls)) * 1000) / 10 + '%' : '0%'
       },
       throughput: {
         tokensPerMinute: runtimeMinutes > 0 ? 
@@ -129,417 +135,355 @@ class PoolSizeFilter {
     const startTime = Date.now();
     this.stats.processed++;
     
-    const { mint, signature, metadata = {} } = tokenData;
+    const { mint, signature, from3_5 = {}, meta = {} } = tokenData;
     
     try {
-      let mintPubkey;
-      try {
-        mintPubkey = new PublicKey(mint);
-      } catch (error) {
-        this.stats.failed++;
-        
-        const result = {
-          pass: false,
-          critical: this.critical,
-          scoreDelta: -1.0,
-          reason: 'invalid_mint_address',
-          action: 'failed',
-          error: error.message,
-          processingTimeMs: Date.now() - startTime
-        };
-        
-        logger.info(`❌ ${this.name}: Invalid mint address`, {
-          mint,
-          signature,
-          ...result
-        });
-        
-        return result;
-      }
+      let marketLabel = from3_5.marketLabel;
       
-      const cacheKey = `pools_${mint}`;
-      let poolData = this.poolCache.get(cacheKey);
-      
-      if (poolData) {
-        this.stats.cacheHits++;
-      } else {
-        this.stats.cacheMisses++;
-        poolData = await this.findTokenPools(mintPubkey);
-        
-        if (poolData.pools.length > 0) {
-          this.poolCache.set(cacheKey, poolData);
-          setTimeout(() => this.poolCache.delete(cacheKey), 300000); // 5 min cache
+      if (!marketLabel) {
+        const smallQuote = await this.getJupiterQuote(mint, Math.floor(this.elSmallSol * 1e9));
+        if (smallQuote && smallQuote.routePlan && smallQuote.routePlan.length > 0) {
+          marketLabel = this.extractMarketLabel(smallQuote);
         }
       }
       
-      if (poolData.pools.length === 0) {
-        this.stats.noPoolsFound++;
-        
-        const result = {
-          pass: true,
-          critical: false,
-          scoreDelta: 0,
-          reason: 'no_pools_found',
-          action: 'passed_no_pools',
-          poolData: poolData,
-          processingTimeMs: Date.now() - startTime
-        };
-        
-        logger.info(`⚠️ ${this.name}: No pools found`, {
-          mint,
-          signature,
-          ...result
+      if (!marketLabel) {
+        this.stats.no_route++;
+        const result = this.createResult(true, 0, 'no_route', 'pass_log_only', {
+          usedCache: false,
+          jupCalls: 1,
+          tookMs: Date.now() - startTime
         });
         
+        this.logTokenResult(mint, signature, result);
         return result;
       }
       
-      this.stats.poolsFound++;
+      const elResult = await this.calculateEffectiveLiquidity(mint, marketLabel);
       
-      let bestPool = null;
-      let maxLiquidity = 0;
+      let volumeResult = null;
+      if (this.volumeCheckEnabled) {
+        volumeResult = await this.checkVolume(mint);
+      }
       
-      for (const pool of poolData.pools) {
-        const poolAnalysis = await this.analyzePool(pool);
-        
-        if (poolAnalysis.liquidityQuote > maxLiquidity) {
-          maxLiquidity = poolAnalysis.liquidityQuote;
-          bestPool = {
-            ...pool,
-            analysis: poolAnalysis
-          };
+      const decision = this.makeDecision(elResult, volumeResult);
+      
+      this.updateStats(decision);
+      
+      const processingTime = Date.now() - startTime;
+      this.updateLatency(processingTime);
+      
+      const result = this.createResult(
+        decision.pass,
+        decision.scoreDelta,
+        decision.reason,
+        decision.action,
+        {
+          marketLabel,
+          el_sol: elResult.elSol,
+          pi_small_bps: elResult.piSmallBps,
+          pi_big_bps: elResult.piBigBps,
+          stepsUsed: elResult.stepsUsed,
+          usedCache: elResult.usedCache,
+          jupCalls: elResult.jupCalls,
+          tookMs: processingTime,
+          volume_window_min: volumeResult?.windowMin,
+          swaps_count: volumeResult?.swapsCount,
+          volume_est_sol: volumeResult?.volumeEstSol
         }
-      }
+      );
       
-      if (!bestPool) {
-        this.stats.failed++;
-        
-        const result = {
-          pass: false,
-          critical: this.critical && this.poolSizeMode === 'BLOCKING',
-          scoreDelta: -0.5,
-          reason: 'pool_analysis_failed',
-          action: 'failed',
-          processingTimeMs: Date.now() - startTime
-        };
-        
-        logger.info(`❌ ${this.name}: Pool analysis failed`, {
-          mint,
-          signature,
-          ...result
-        });
-        
-        return result;
-      }
-      
-      const { liquidityQuote, volumeWindowQuote, turnover, quoteType } = bestPool.analysis;
-      
-      let failureReasons = [];
-      let passed = true;
-      
-      if (liquidityQuote < this.minLiqQuote) {
-        failureReasons.push('low_liquidity');
-        this.stats.lowLiquidity++;
-        passed = false;
-      }
-      
-      if (volumeWindowQuote < this.minVolWindowQuote) {
-        failureReasons.push('low_volume');
-        this.stats.lowVolume++;
-        passed = false;
-      }
-      
-      if (turnover < this.minTurnover) {
-        failureReasons.push('low_turnover');
-        this.stats.lowTurnover++;
-        passed = false;
-      }
-      
-      if (this.poolSizeMode === 'LOG_ONLY') {
-        passed = true;
-      }
-      
-      if (passed) {
-        this.stats.passed++;
-      } else {
-        this.stats.failed++;
-      }
-      
-      const result = {
-        pass: passed,
-        critical: this.critical && !passed && this.poolSizeMode === 'BLOCKING',
-        scoreDelta: 0,
-        reason: passed ? 
-          `liq=${Math.round(liquidityQuote)}, vol=${Math.round(volumeWindowQuote)}, turnover=${turnover.toFixed(2)}` :
-          failureReasons.join(', '),
-        action: passed ? 'passed' : 'failed',
-        poolData: {
-          poolAddress: bestPool.address,
-          quoteType: quoteType,
-          liquidityQuote: liquidityQuote,
-          volumeWindowQuote: volumeWindowQuote,
-          turnover: turnover,
-          failureReasons: failureReasons
-        },
-        processingTimeMs: Date.now() - startTime
-      };
-      
-      const logPrefix = passed ? '✅' : '❌';
-      const logAction = passed ? 'PASS' : `FAIL_${failureReasons.join('_').toUpperCase()}`;
-      
-      logger.info(`${logPrefix} ${this.name}: ${logAction}`, {
-        mint,
-        signature,
-        pool: bestPool.address,
-        quote: quoteType,
-        liq: Math.round(liquidityQuote),
-        vol: Math.round(volumeWindowQuote),
-        turnover: turnover.toFixed(2),
-        ...result
-      });
-      
+      this.logTokenResult(mint, signature, result);
       return result;
       
     } catch (error) {
-      if (error.message === 'RPC timeout') {
-        this.stats.timeouts++;
-      } else {
-        this.stats.rpcErrors++;
-      }
+      this.stats.timeouts++;
       
-      const shouldPass = !this.critical || this.poolSizeMode === 'LOG_ONLY';
-      
-      if (shouldPass) {
-        this.stats.passed++;
-      } else {
-        this.stats.failed++;
-      }
-      
-      const result = {
-        pass: shouldPass,
-        critical: false,
-        scoreDelta: 0,
-        reason: error.message === 'RPC timeout' ? 'rpc_timeout' : 'rpc_error',
-        action: shouldPass ? 'error_pass' : 'error_fail',
+      const result = this.createResult(true, 0, 'rate_limited', 'pass_log_only', {
         error: error.message,
-        processingTimeMs: Date.now() - startTime
-      };
+        tookMs: Date.now() - startTime
+      });
       
       logger.error(`💥 ${this.name}: Processing error`, {
         mint,
         signature,
-        ...result
+        error: error.message
       });
       
       return result;
     }
   }
   
-  async findTokenPools(mintPubkey) {
-    const pools = [];
+  async getJupiterQuote(mint, amountLamports) {
+    const cacheKey = `${mint}|${amountLamports}|${this.jupiterOutputMint}`;
     
-    try {
-      for (const ammProgram of this.ammPrograms) {
-        const programPubkey = new PublicKey(ammProgram);
-        
-        const accounts = await Promise.race([
-          this.connection.getProgramAccounts(programPubkey, {
-            filters: [
-              {
-                memcmp: {
-                  offset: 400, // Approximate offset for token mints in pool data
-                  bytes: mintPubkey.toBase58()
-                }
-              }
-            ]
-          }),
-          new Promise((_, reject) => 
-            setTimeout(() => reject(new Error('RPC timeout')), this.timeout)
-          )
-        ]);
-        
-        for (const account of accounts) {
-          try {
-            const poolInfo = this.parsePoolAccount(account, mintPubkey);
-            if (poolInfo) {
-              pools.push(poolInfo);
-            }
-          } catch (parseError) {
-            continue;
-          }
-        }
-        
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
-    } catch (error) {
-      logger.error(`💥 ${this.name}: Error finding pools`, {
-        mint: mintPubkey.toString(),
-        error: error.message
-      });
+    const cached = this.jupiterCache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < this.jupiterCacheTtl) {
+      this.stats.cache_hits++;
+      return cached.data;
     }
     
-    return { pools };
-  }
-  
-  parsePoolAccount(account, targetMint) {
+    await this.waitForRateLimit();
+    
     try {
-      const data = account.account.data;
+      this.stats.jup_calls++;
       
-      if (data.length < 200) return null;
+      const url = new URL(this.jupiterQuotePath, this.jupiterBaseUrl);
+      url.searchParams.set('inputMint', mint);
+      url.searchParams.set('outputMint', this.jupiterOutputMint);
+      url.searchParams.set('amount', amountLamports.toString());
+      url.searchParams.set('slippageBps', this.jupiterSlippageBps.toString());
+      url.searchParams.set('restrictIntermediateTokens', 'true');
       
-      const tokenAMint = new PublicKey(data.slice(8, 40)).toString();
-      const tokenBMint = new PublicKey(data.slice(40, 72)).toString();
-      const tokenAVault = new PublicKey(data.slice(72, 104)).toString();
-      const tokenBVault = new PublicKey(data.slice(104, 136)).toString();
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), this.jupiterTimeout);
       
-      const targetMintStr = targetMint.toString();
+      const response = await fetch(url.toString(), {
+        method: 'GET',
+        headers: {
+          'Accept': 'application/json',
+          'User-Agent': 'SalonSniper/1.0'
+        },
+        signal: controller.signal
+      });
       
-      if (tokenAMint !== targetMintStr && tokenBMint !== targetMintStr) {
-        return null;
+      clearTimeout(timeoutId);
+      
+      if (response.status === 429) {
+        this.stats.jup_429++;
+        throw new Error('Rate limited');
       }
       
-      let quoteMint, quoteVault, baseMint, baseVault;
-      
-      if (this.quoteTokens.includes(tokenAMint)) {
-        quoteMint = tokenAMint;
-        quoteVault = tokenAVault;
-        baseMint = tokenBMint;
-        baseVault = tokenBVault;
-      } else if (this.quoteTokens.includes(tokenBMint)) {
-        quoteMint = tokenBMint;
-        quoteVault = tokenBVault;
-        baseMint = tokenAMint;
-        baseVault = tokenAVault;
-      } else {
-        return null;
+      if (!response.ok) {
+        throw new Error(`Jupiter API error: ${response.status}`);
       }
       
-      return {
-        address: account.pubkey.toString(),
-        tokenAMint,
-        tokenBMint,
-        tokenAVault,
-        tokenBVault,
-        quoteMint,
-        quoteVault,
-        baseMint,
-        baseVault
-      };
+      const data = await response.json();
+      
+      this.jupiterCache.set(cacheKey, {
+        data,
+        timestamp: Date.now()
+      });
+      
+      setTimeout(() => this.jupiterCache.delete(cacheKey), this.jupiterCacheTtl);
+      
+      return data;
       
     } catch (error) {
+      if (error.name === 'AbortError') {
+        this.stats.timeouts++;
+        throw new Error('Jupiter timeout');
+      }
+      throw error;
+    }
+  }
+  
+  async waitForRateLimit() {
+    const now = Date.now();
+    const minInterval = 1000 / this.qpsMax; // ms between requests
+    const timeSinceLastRequest = now - this.lastRequestTime;
+    
+    if (timeSinceLastRequest < minInterval) {
+      await new Promise(resolve => setTimeout(resolve, minInterval - timeSinceLastRequest));
+    }
+    
+    this.lastRequestTime = Date.now();
+  }
+  
+  extractMarketLabel(quote) {
+    if (!quote.routePlan || quote.routePlan.length === 0) return null;
+    
+    for (const step of quote.routePlan) {
+      if (step.swapInfo && step.swapInfo.label) {
+        return step.swapInfo.label;
+      }
+    }
+    
+    return 'Unknown';
+  }
+  
+  async calculateEffectiveLiquidity(mint, marketLabel) {
+    const smallAmount = Math.floor(this.elSmallSol * 1e9);
+    const bigAmount = Math.floor(this.elBigSol * 1e9);
+    
+    let jupCalls = 0;
+    let usedCache = false;
+    
+    const smallQuote = await this.getJupiterQuote(mint, smallAmount);
+    jupCalls++;
+    
+    if (!smallQuote || !smallQuote.routePlan || smallQuote.routePlan.length === 0) {
+      return {
+        elSol: 0,
+        piSmallBps: 0,
+        piBigBps: 0,
+        stepsUsed: 0,
+        usedCache,
+        jupCalls
+      };
+    }
+    
+    const piSmallBps = smallQuote.priceImpactPct ? Math.round(smallQuote.priceImpactPct * 10000) : 0;
+    
+    const bigQuote = await this.getJupiterQuote(mint, bigAmount);
+    jupCalls++;
+    
+    if (!bigQuote || !bigQuote.routePlan || bigQuote.routePlan.length === 0) {
+      return {
+        elSol: this.elSmallSol,
+        piSmallBps,
+        piBigBps: 0,
+        stepsUsed: 0,
+        usedCache,
+        jupCalls
+      };
+    }
+    
+    const piBigBps = bigQuote.priceImpactPct ? Math.round(bigQuote.priceImpactPct * 10000) : 0;
+    
+    if (piBigBps <= this.jupiterTargetPiBps) {
+      return {
+        elSol: this.elBigSol,
+        piSmallBps,
+        piBigBps,
+        stepsUsed: 0,
+        usedCache,
+        jupCalls
+      };
+    }
+    
+    let low = this.elSmallSol;
+    let high = this.elBigSol;
+    let bestEl = this.elSmallSol;
+    let stepsUsed = 0;
+    
+    for (let step = 0; step < this.elMaxSteps; step++) {
+      const mid = (low + high) / 2;
+      const midAmount = Math.floor(mid * 1e9);
+      
+      const midQuote = await this.getJupiterQuote(mint, midAmount);
+      jupCalls++;
+      stepsUsed++;
+      
+      if (!midQuote || !midQuote.routePlan || midQuote.routePlan.length === 0) {
+        high = mid;
+        continue;
+      }
+      
+      const midPiBps = midQuote.priceImpactPct ? Math.round(midQuote.priceImpactPct * 10000) : 0;
+      
+      if (midPiBps <= this.jupiterTargetPiBps) {
+        bestEl = mid;
+        low = mid;
+      } else {
+        high = mid;
+      }
+      
+      if (high - low < 0.01) break;
+    }
+    
+    return {
+      elSol: bestEl,
+      piSmallBps,
+      piBigBps,
+      stepsUsed,
+      usedCache,
+      jupCalls
+    };
+  }
+  
+  async checkVolume(mint) {
+    if (!this.volumeCheckEnabled || !this.heliusTxHistory) {
+      return null;
+    }
+    
+    try {
+      return {
+        windowMin: this.volumeWindowMin,
+        swapsCount: 0,
+        volumeEstSol: 0
+      };
+    } catch (error) {
+      logger.error(`💥 ${this.name}: Volume check error`, {
+        mint,
+        error: error.message
+      });
       return null;
     }
   }
   
-  async analyzePool(pool) {
-    try {
-      const vaultPubkey = new PublicKey(pool.quoteVault);
-      
-      const accountInfo = await Promise.race([
-        this.connection.getAccountInfo(vaultPubkey),
-        new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('RPC timeout')), this.timeout)
-        )
-      ]);
-      
-      if (!accountInfo || !accountInfo.data) {
-        throw new Error('Vault account not found');
-      }
-      
-      const vaultBalance = this.parseTokenAccountBalance(accountInfo.data);
-      const liquidityQuote = vaultBalance * 2; // Approximate TVL
-      
-      const volumeData = await this.calculateVolume(pool.quoteVault);
-      const volumeWindowQuote = volumeData.volume;
-      
-      const turnover = liquidityQuote > 0 ? volumeWindowQuote / liquidityQuote : 0;
-      
-      const quoteType = this.getQuoteType(pool.quoteMint);
-      
+  makeDecision(elResult, volumeResult) {
+    const { elSol } = elResult;
+    
+    if (elSol >= this.minElSol) {
+      this.stats.el_ok++;
       return {
-        liquidityQuote,
-        volumeWindowQuote,
-        turnover,
-        quoteType
+        pass: true,
+        scoreDelta: 0.1,
+        reason: 'el_ok',
+        action: 'passed'
       };
-      
-    } catch (error) {
-      throw new Error(`Pool analysis failed: ${error.message}`);
+    } else {
+      this.stats.el_low++;
+      return {
+        pass: false,
+        scoreDelta: -0.3,
+        reason: 'el_low',
+        action: 'failed'
+      };
     }
   }
   
-  parseTokenAccountBalance(data) {
-    try {
-      if (data.length < 72) return 0;
-      
-      const amount = data.readBigUInt64LE(64);
-      return Number(amount) / 1e9; // Assume 9 decimals for SOL/USDC
-      
-    } catch (error) {
-      return 0;
+  updateStats(decision) {
+    if (decision.pass) {
+      this.stats.passed++;
+    } else {
+      this.stats.failed++;
     }
   }
   
-  async calculateVolume(vaultAddress) {
-    const cacheKey = `volume_${vaultAddress}`;
-    const cached = this.volumeCache.get(cacheKey);
+  updateLatency(processingTime) {
+    if (this.stats.processed === 1) {
+      this.stats.avg_latency_ms = processingTime;
+    } else {
+      this.stats.avg_latency_ms = (this.stats.avg_latency_ms * (this.stats.processed - 1) + processingTime) / this.stats.processed;
+    }
+  }
+  
+  createResult(pass, scoreDelta, reason, action, meta) {
+    return {
+      pass,
+      critical: false,
+      scoreDelta,
+      reason,
+      action,
+      meta,
+      processingTimeMs: meta.tookMs || 0
+    };
+  }
+  
+  logTokenResult(mint, signature, result) {
+    const logData = {
+      ts: new Date().toISOString(),
+      mint,
+      marketLabel: result.meta.marketLabel || 'unknown',
+      el_sol: result.meta.el_sol || 0,
+      pi_small_bps: result.meta.pi_small_bps || 0,
+      pi_big_bps: result.meta.pi_big_bps || 0,
+      stepsUsed: result.meta.stepsUsed || 0,
+      usedCache: result.meta.usedCache || false,
+      jupCalls: result.meta.jupCalls || 0,
+      reason: result.reason,
+      action: result.action,
+      tookMs: result.meta.tookMs || 0
+    };
     
-    if (cached && Date.now() - cached.timestamp < 60000) { // 1 min cache
-      return cached.data;
-    }
-    
-    try {
-      const url = this.restApiUrl.replace('{address}', vaultAddress);
-      const response = await fetch(`${url}&limit=${this.lookbackTxCount}`);
-      
-      if (!response.ok) {
-        throw new Error(`REST API error: ${response.status}`);
-      }
-      
-      const transactions = await response.json();
-      
-      let totalVolume = 0;
-      const cutoffTime = Date.now() - (this.lookbackMin * 60 * 1000);
-      
-      for (const tx of transactions) {
-        if (tx.timestamp * 1000 < cutoffTime) break;
-        
-        if (tx.tokenTransfers) {
-          for (const transfer of tx.tokenTransfers) {
-            if (transfer.toTokenAccount === vaultAddress || 
-                transfer.fromTokenAccount === vaultAddress) {
-              totalVolume += Math.abs(transfer.tokenAmount || 0);
-            }
-          }
-        }
-      }
-      
-      const volumeData = { volume: totalVolume / 1e9 }; // Convert to SOL/USDC units
-      
-      this.volumeCache.set(cacheKey, {
-        data: volumeData,
-        timestamp: Date.now()
-      });
-      
-      setTimeout(() => this.volumeCache.delete(cacheKey), 300000); // 5 min cleanup
-      
-      return volumeData;
-      
-    } catch (error) {
-      logger.error(`💥 ${this.name}: Volume calculation error`, {
-        vault: vaultAddress,
-        error: error.message
-      });
-      
-      return { volume: 0 };
-    }
-  }
-  
-  getQuoteType(quoteMint) {
-    if (quoteMint === 'So11111111111111111111111111111111111111112') return 'SOL';
-    if (quoteMint === 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v') return 'USDC';
-    if (quoteMint === 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB') return 'USDT';
-    return 'UNKNOWN';
+    const logPrefix = result.pass ? '✅' : '❌';
+    logger.info(`${logPrefix} ${this.name}: ${result.action.toUpperCase()}`, {
+      mint,
+      signature,
+      ...logData
+    });
   }
   
   getStats() {
@@ -548,10 +492,8 @@ class PoolSizeFilter {
       enabled: this.enabled,
       passRate: this.stats.processed > 0 ? 
         (this.stats.passed / this.stats.processed) * 100 : 0,
-      poolFoundRate: this.stats.processed > 0 ? 
-        (this.stats.poolsFound / this.stats.processed) * 100 : 0,
-      cacheHitRate: (this.stats.cacheHits + this.stats.cacheMisses) > 0 ? 
-        (this.stats.cacheHits / (this.stats.cacheHits + this.stats.cacheMisses)) * 100 : 0
+      cacheHitRate: (this.stats.cache_hits + this.stats.jup_calls) > 0 ? 
+        (this.stats.cache_hits / (this.stats.cache_hits + this.stats.jup_calls)) * 100 : 0
     };
   }
   
@@ -566,12 +508,10 @@ class PoolSizeFilter {
   }
   
   updateConfig(config) {
-    if (config.minLiqQuote !== undefined) this.minLiqQuote = config.minLiqQuote;
-    if (config.minVolWindowQuote !== undefined) this.minVolWindowQuote = config.minVolWindowQuote;
-    if (config.minTurnover !== undefined) this.minTurnover = config.minTurnover;
-    if (config.poolSizeMode !== undefined) this.poolSizeMode = config.poolSizeMode;
-    if (config.lookbackMin !== undefined) this.lookbackMin = config.lookbackMin;
-    if (config.timeout !== undefined) this.timeout = config.timeout;
+    if (config.minElSol !== undefined) this.minElSol = config.minElSol;
+    if (config.jupiterTargetPiBps !== undefined) this.jupiterTargetPiBps = config.jupiterTargetPiBps;
+    if (config.elMaxSteps !== undefined) this.elMaxSteps = config.elMaxSteps;
+    if (config.qpsMax !== undefined) this.qpsMax = config.qpsMax;
     if (config.critical !== undefined) this.critical = config.critical;
     
     logger.info(`🔧 ${this.name}: Configuration updated`, config);
